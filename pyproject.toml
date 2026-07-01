@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "survey-invariant-lensnn"
+version = "0.1.0"
+description = "Survey-invariant embedding network for strong gravitational lens images (PSF- and pixel-scale-invariant deblurring + Einstein-radius regression)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Deep Skies Lab" }]
+keywords = ["strong-lensing", "cosmology", "deep-learning", "simulation-based-inference", "transformer", "deconvolution"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Astronomy",
+]
+dependencies = [
+    "numpy",
+    "scipy",
+    "torch>=2.0",
+    "lightning>=2.0",
+    "torchmetrics",
+    "scikit-image",
+    "astropy",
+    "lenstronomy",
+    "pandas",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-cov", "ruff", "build"]
+
+[project.urls]
+Homepage = "https://github.com/deepskies"
+Repository = "https://github.com/deepskies/survey-invariant-lensnn"
+
+# Each CLI keeps a main(); expose them as console scripts.
+[project.scripts]
+survey-lens-train    = "survey_lens.train:main"
+survey-lens-test     = "survey_lens.test:main"
+survey-lens-diagnose = "survey_lens.diagnose:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
