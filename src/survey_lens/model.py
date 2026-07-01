@@ -149,11 +149,19 @@ class TriAttentionBlock(nn.Module):
 # ---------------------------------------------------------------------------
 class SurveyInvariantLensNet(nn.Module):
     def __init__(self, patch=4, dim=128, depth=4, n_heads=4,
-                 theta_ref=1.0, use_cross_attention=True, mlp_ratio=4.0):
+                 theta_ref=0.3, rope_base=100.0,
+                 use_cross_attention=True, mlp_ratio=4.0):
         super().__init__()
         self.patch = patch
         self.dim = dim
+        # theta_ref (arcsec) sets the finest RoPE wavelength (~2*pi*theta_ref);
+        # rope_base sets how fast the frequency bank decays. Defaults tuned so
+        # the informative bands land on sub-arcsec--to--few-arcsec structure
+        # (arcs, Einstein ring theta_E~0.5-2.5"), not the >field-width scales
+        # the original (theta_ref=1.0, base=1e4) wasted 13/16 bands on.
+        # See tests/test_rope_coverage.py for the coverage assertion.
         self.theta_ref = theta_ref
+        self.rope_base = rope_base
         self.use_cross = use_cross_attention
         self.patch_dim = patch * patch
         self.patch_proj = nn.Linear(self.patch_dim, dim)   # shared img/psf projection
@@ -222,7 +230,7 @@ class SurveyInvariantLensNet(nn.Module):
         s_val = float(s[0].item())
         pos = self._patch_positions(gh, gw, s_val, device)         # [nP,2]
         hd = self.dim // self.blocks[0].img_self.n_heads
-        cos, sin = build_2d_rope(pos, hd)
+        cos, sin = build_2d_rope(pos, hd, base=self.rope_base)
         cos_i = sin_i = None
         cos_i, sin_i = cos, sin
         cos_p, sin_p = cos, sin   # identical pipeline for PSF (shared frame)

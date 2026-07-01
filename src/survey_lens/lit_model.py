@@ -21,7 +21,8 @@ from . import losses as Lo
 class LitLensNet(L.LightningModule):
     def __init__(self,
                  # --- architecture ---
-                 patch=4, dim=128, depth=4, n_heads=4, theta_ref=1.0,
+                 patch=4, dim=128, depth=4, n_heads=4,
+                 theta_ref=0.3, rope_base=100.0,
                  use_cross_attention=True,
                  # --- loss configuration ---
                  loss_mode="joint",          # "joint" | "recon_only" | "reg_only"
@@ -35,7 +36,8 @@ class LitLensNet(L.LightningModule):
         self.save_hyperparameters()
         self.net = SurveyInvariantLensNet(
             patch=patch, dim=dim, depth=depth, n_heads=n_heads,
-            theta_ref=theta_ref, use_cross_attention=use_cross_attention)
+            theta_ref=theta_ref, rope_base=rope_base,
+            use_cross_attention=use_cross_attention)
 
     def forward(self, g, h, s):
         return self.net(g, h, s)

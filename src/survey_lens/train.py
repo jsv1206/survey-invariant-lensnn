@@ -45,6 +45,12 @@ def main():
     ap.add_argument("--depth", type=int, default=4)
     ap.add_argument("--heads", type=int, default=4)
     ap.add_argument("--patch", type=int, default=4)
+    ap.add_argument("--theta-ref", type=float, default=0.3,
+                    help="arcsec normalization for RoPE coords; sets finest "
+                         "positional wavelength (~2*pi*theta_ref)")
+    ap.add_argument("--rope-base", type=float, default=100.0,
+                    help="RoPE frequency decay base (lower = tighter band on "
+                         "in-field scales)")
     ap.add_argument("--no-cross-attention", action="store_true")
     # loss
     ap.add_argument("--loss-mode", default="joint",
@@ -67,6 +73,7 @@ def main():
 
     lit = LitLensNet(
         patch=args.patch, dim=args.dim, depth=args.depth, n_heads=args.heads,
+        theta_ref=args.theta_ref, rope_base=args.rope_base,
         use_cross_attention=not args.no_cross_attention,
         loss_mode=args.loss_mode, lambda_c=args.lambda_c, lambda_d=args.lambda_d,
         lr=args.lr)
