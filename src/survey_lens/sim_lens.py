@@ -121,11 +121,21 @@ def _render_sharp(params, scale, npix):
 
 
 def _area_resample(img_fine, factor):
-    """Average-pool a fine image by integer factor (area resampling / flux conserving mean)."""
+    """Sum-pool a fine image by integer factor (flux-conserving area resampling).
+
+    lenstronomy's ImageModel.image() returns flux PER PIXEL, not surface
+    brightness, so collapsing `factor**2` fine pixels into one native pixel
+    must SUM their flux, not average it -- averaging divides brightness by
+    `factor**2` and, since the supersampling factor is chosen adaptively per
+    sample (see choose_supersample_factor), that turns into a per-sample,
+    scale-correlated amplitude error. See CLAUDE.md bug 9 / HANDOFF_run1.md
+    Step 0. Do NOT apply this to the PSF stamp `h`, which must stay
+    sum-normalized to 1.
+    """
     n = img_fine.shape[0]
     m = n // factor
     img = img_fine[:m * factor, :m * factor]
-    return img.reshape(m, factor, m, factor).mean(axis=(1, 3))
+    return img.reshape(m, factor, m, factor).sum(axis=(1, 3))
 
 
 def choose_supersample_factor(s_target, fwhm, factor_min=4, sigma_px_target=3.0):
