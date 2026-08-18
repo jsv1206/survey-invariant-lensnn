@@ -18,10 +18,21 @@ import torch.nn.functional as F
 
 
 def ssim(a, b, C1=0.01 ** 2, C2=0.03 ** 2, window=7):
-    """Mean SSIM between two [B,1,H,W] images (values roughly in a shared range).
+    """Mean SSIM between two [B,1,H,W] images.
+
+    `C1`/`C2` assume data in [0,1] (the standard SSIM convention), but these
+    images peak at ~0.017-0.19 depending on survey (CLAUDE.md bug 6), so both
+    inputs are first divided by `b`'s per-sample peak -- every call site here
+    passes (f_hat, f_gt), so `b` is always ground truth. A SHARED scalar keeps
+    the comparison fair (do not normalize `a` by its own peak, which would
+    hide amplitude error); without this, measured ssim(blurred, sharp) was
+    0.999993 (HST)/0.986732 (DES), i.e. saturated. `lambda_a` is unchanged --
+    this is a normalization fix, not a reweighting.
 
     Uses a uniform window (box filter); adequate as a structural regularizer.
     """
+    peak = b.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
+    a, b = a / peak, b / peak
     pad = window // 2
     mu_a = F.avg_pool2d(a, window, 1, pad)
     mu_b = F.avg_pool2d(b, window, 1, pad)
