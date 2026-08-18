@@ -63,27 +63,42 @@ not visible from the source. Regression tests for 1 and 2 live in
    ‖f̂*h − g‖² inherits that error. Fix: sample `h` on a finer grid than the image (the PSF
    token stream has its own coordinates), or document as a limitation.
 
-4. **PARTLY RESOLVED — token counts vary 30×.** At `patch=4`, FOV 20″: HST npix=400 →
-   **10,000 image + 10,000 PSF tokens**; Euclid 2,500; Roman 2,025; Rubin 625; DES 361;
-   training prior edge (s=0.04″) 15,625. Measured peak is 8.0 GB at batch 8, which FITS
-   the 20 GB GPU (see Hardware section) — so this is a budgeting fact, not a blocker.
-   **Always smoke-test at the prior edge (s=0.04″), not a random draw** — a random draw
-   usually yields a cheap grid and hides the worst case.
+4. **RESOLVED (memory budget) — token counts vary 30×.** At `patch=4`, FOV 20″: HST
+   npix=400 → **10,000 image + 10,000 PSF tokens**; Euclid 2,500; Roman 2,025; Rubin 625;
+   DES 361; training prior edge (s=0.04″) 15,625. Measured peak is **10.7 GB** at batch 8
+   (Step 7, real GPU run — see Hardware section; supersedes the 8.0 GB figure below, which
+   predated the Step 1 reblur-cost fix), which FITS the 20 GB GPU — so this is a budgeting
+   fact, not a blocker. **Always smoke-test at the prior edge (s=0.04″), not a random
+   draw** — a random draw usually yields a cheap grid and hides the worst case.
 
 ## Hardware and GPU status (Aug 2026)
 
 Target: a single **20 GB GPU**. Simulation is CPU-only (lenstronomy); training is GPU.
+Confirmed Aug 2026 (Step 7): this sandbox's actual GPU is an **NVIDIA A100 80GB PCIe MIG
+2g.20gb** slice — 20.9 GB, matching the target exactly.
 
 - `train.py` is GPU-ready: `accelerator="auto"`, model builds tensors on `g.device`,
   attention uses `F.scaled_dot_product_attention` (memory-efficient path available).
 - **`test.py` and `diagnose.py` default to `--device cpu`** — pass `--device cuda`.
-- Dataloader sets no `num_workers`/`pin_memory`; with a frozen cached dataset, add them.
-- **Measured peak memory** (batch=8, dim=128, depth=4, fp32, patch=4), by token count:
-  361 tok 0.5 GB · 2.5k tok 2.0 GB · 10k tok (HST) 5.2 GB · **15.6k tok 8.0 GB**.
-  The 15.6k figure is the *training prior edge* (s=0.04″), not HST — 10.3% of training
-  draws exceed HST's token count, so the prior sets the ceiling. 8 GB at batch 8 fits
-  20 GB with headroom; if OOM, drop batch size before touching patch/FOV.
-  `patch=8` cuts peak 2.7× (8.0 → 3.0 GB) if more headroom is needed.
+- **Dataloaders now set `num_workers=4, pin_memory=True, persistent_workers=True`
+  automatically when `LensDataModule(cache_dir=...)` is used** (Step 7); the in-memory
+  path (`cache_dir=None`) still sets none of these, since a worker would fork (and
+  duplicate) the whole in-memory dataset. Measured epoch-time effect on a 500-sample
+  smoke run: 130.0s/epoch (no workers) -> 123.8s/epoch (`num_workers=4`), a modest ~5% —
+  at this model/image scale GPU compute (long attention sequences, up to 15.6k tokens)
+  dominates over data-loading I/O, so this is a smaller lever than expected. Kept anyway
+  since it's free.
+- **Measured peak memory, Step 7, real GPU run** (`LitLensNet` + `AdamW`, batch=8,
+  dim=128, depth=4, fp32, patch=4) at the training prior edge (s=0.04″, npix=500,
+  15,625 tokens/stream): **10.73 GB** allocated (10.79 GB reserved) —
+  `torch.cuda.max_memory_allocated()`, two full optimizer steps. Comfortably fits the
+  20.9 GB MIG GPU (~10 GB headroom). This **supersedes** an earlier, lower estimate of
+  8.0 GB (measured pre-Step-1, when the reblur term's cost/behavior was different) — do
+  not use 8.0 GB for capacity planning. If OOM, drop batch size before touching
+  patch/FOV. (A prior draft claimed `patch=8` "cuts peak 2.7× (8.0 -> 3.0 GB)" —
+  that was from the same superseded pre-Step-1 estimate; re-measure before relying on it.)
+  Earlier (superseded) table by token count, batch=8: 361 tok 0.5 GB · 2.5k tok 2.0 GB ·
+  10k tok (HST) 5.2 GB · 15.6k tok 8.0 GB (now 10.73 GB, see above).
 - **Decision (Aug 2026): keep HST in both training prior and test set.** Dropping it
   would remove 42% of the log pixel-scale ladder (5.3× → 2.6×, leaving Euclid and Roman
   only 1.1× apart) while saving nothing, since the prior edge dominates memory anyway.

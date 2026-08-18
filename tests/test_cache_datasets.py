@@ -136,6 +136,26 @@ def test_size_bucket_sampler_does_not_load_pixels(tmp_path, monkeypatch):
     assert calls == [], f"SizeBucketSampler triggered {len(calls)} np.load() call(s)"
 
 
+def test_dataloader_workers_only_with_cache_dir(tmp_path):
+    """HANDOFF_run1.md Step 7: num_workers/pin_memory/persistent_workers must
+    be enabled ONLY for the cached path -- with in-memory SimLensDataset, a
+    DataLoader worker would fork (and duplicate) the whole already-materialized
+    dataset instead of reading small per-sample files."""
+    cache_flat_split("train", n=2, seed=0, fov=FOV, fine_scale=None,
+                     n_workers=2, out_root=str(tmp_path))
+    cache_flat_split("val", n=2, seed=1, fov=FOV, fine_scale=None,
+                     n_workers=2, out_root=str(tmp_path))
+
+    dm_mem = LensDataModule(n_train=2, n_val=2, fov=FOV)
+    assert dm_mem._loader_kwargs() == {}
+
+    dm_cached = LensDataModule(n_train=2, n_val=2, fov=FOV, cache_dir=str(tmp_path))
+    kwargs = dm_cached._loader_kwargs()
+    assert kwargs.get("num_workers") == 4
+    assert kwargs.get("pin_memory") is True
+    assert kwargs.get("persistent_workers") is True
+
+
 def test_lens_data_module_rejects_size_mismatch(tmp_path):
     """If the cache has a different n than requested, fail loudly rather
     than silently training on the wrong split size."""

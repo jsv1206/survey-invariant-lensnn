@@ -286,12 +286,25 @@ class LensDataModule(L.LightningDataModule):
                                      fov=h.fov, fine_scale=h.fine_scale,
                                      survey_configs=self.survey_configs)
 
+    def _loader_kwargs(self):
+        # num_workers only pays off once data is cached (HANDOFF_run1.md Step
+        # 7): with the in-memory path, SimLensDataset already holds every
+        # sample's pixels in RAM, so each DataLoader worker process would
+        # FORK (and duplicate) the whole in-memory dataset instead of reading
+        # small per-sample files -- expensive and pointless. With cache_dir
+        # set, each worker just opens its own .npz files.
+        if self.cache_dir is None:
+            return {}
+        return dict(num_workers=4, pin_memory=True, persistent_workers=True)
+
     def train_dataloader(self):
         sampler = SizeBucketSampler(self.train_ds, self.hparams.batch_size,
                                     shuffle=True, seed=self.hparams.seed)
-        return DataLoader(self.train_ds, batch_sampler=sampler, collate_fn=collate)
+        return DataLoader(self.train_ds, batch_sampler=sampler, collate_fn=collate,
+                          **self._loader_kwargs())
 
     def val_dataloader(self):
         sampler = SizeBucketSampler(self.val_ds, self.hparams.batch_size,
                                     shuffle=False, seed=self.hparams.seed)
-        return DataLoader(self.val_ds, batch_sampler=sampler, collate_fn=collate)
+        return DataLoader(self.val_ds, batch_sampler=sampler, collate_fn=collate,
+                          **self._loader_kwargs())
