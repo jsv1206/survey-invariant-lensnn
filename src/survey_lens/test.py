@@ -34,10 +34,23 @@ from . import surveys as SV
 
 
 @torch.no_grad()
-def evaluate_survey(model, items, batch_size=16, device="cpu"):
-    """Run the model over one survey's samples (all share grid size)."""
+def evaluate_survey(model, items, batch_size=16, device="cpu", mask_thresh=0.01):
+    """Run the model over one survey's samples (all share grid size).
+
+    Reports each reconstruction metric two ways (HANDOFF_run1.md Step 3):
+    raw (recon_l1/recon_ssim, kept for continuity -- NOT comparable across
+    surveys, since peak brightness varies ~11x with pixel scale) and
+    peak-normalized (both f_hat/f_gt divided by f_gt's per-sample peak before
+    L1/SSIM, so surveys ARE comparable), each of the latter both masked to
+    the arc region (`f_gt > mask_thresh * peak`, the headline number -- only
+    2.7-4.0% of pixels clear it) and over the full frame (the hallucination
+    check, ~96% trivial empty-sky agreement). `mask_frac` logs the masked
+    pixel fraction per sample so the global-metric dilution is visible.
+    """
     theta_pred, theta_true = [], []
     l1_sum = ssim_sum = reblur_sum = 0.0
+    l1_norm_masked_sum = l1_norm_global_sum = ssim_norm_masked_sum = 0.0
+    mask_frac_sum = 0.0
     n = len(items)
     for i in range(0, n, batch_size):
         chunk = items[i:i + batch_size]
@@ -57,6 +70,18 @@ def evaluate_survey(model, items, batch_size=16, device="cpu"):
         ssim_sum += Lo.ssim(f_hat, f).item() * bs
         reblur_sum += Lo.reblur_loss(f_hat, h, g).item() * bs
 
+        peak = f.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
+        f_hat_n, f_n = f_hat / peak, f / peak
+        mask = f_n > mask_thresh                                   # [B,1,H,W] bool
+        mask_f = mask.to(f_n.dtype)
+        denom = mask_f.sum(dim=(1, 2, 3)).clamp_min(1.0)
+        absdiff = (f_hat_n - f_n).abs()
+        l1_masked_per_sample = (absdiff * mask_f).sum(dim=(1, 2, 3)) / denom
+        l1_norm_masked_sum += l1_masked_per_sample.sum().item()
+        l1_norm_global_sum += absdiff.mean(dim=(1, 2, 3)).sum().item()
+        ssim_norm_masked_sum += Lo.ssim(f_hat, f, mask=mask).item() * bs
+        mask_frac_sum += (mask_f.sum(dim=(1, 2, 3)) / mask_f[0].numel()).sum().item()
+
     tp = torch.cat(theta_pred).numpy()
     tt = torch.cat(theta_true).numpy()
     err = tp - tt
@@ -67,6 +92,10 @@ def evaluate_survey(model, items, batch_size=16, device="cpu"):
         theta_scatter=float(np.std(err)),
         recon_l1=l1_sum / n,
         recon_ssim=ssim_sum / n,
+        recon_l1_norm_masked=l1_norm_masked_sum / n,
+        recon_l1_norm_global=l1_norm_global_sum / n,
+        recon_ssim_norm=ssim_norm_masked_sum / n,
+        mask_frac=mask_frac_sum / n,
         reblur_mse=reblur_sum / n,
         n=n,
     )
@@ -175,9 +204,15 @@ def main():
                          theta_rmse=r["theta_rmse"], theta_bias=r["theta_bias"],
                          theta_scatter=r["theta_scatter"],
                          recon_l1=r["recon_l1"], recon_ssim=r["recon_ssim"],
+                         recon_l1_norm_masked=r["recon_l1_norm_masked"],
+                         recon_l1_norm_global=r["recon_l1_norm_global"],
+                         recon_ssim_norm=r["recon_ssim_norm"],
+                         mask_frac=r["mask_frac"],
                          reblur_mse=r["reblur_mse"]))
         print(f"  {nm:7s} theta_rmse={r['theta_rmse']:.4f} bias={r['theta_bias']:+.4f} "
-              f"ssim={r['recon_ssim']:.3f} reblur={r['reblur_mse']:.2e}")
+              f"ssim_norm_masked={r['recon_ssim_norm']:.3f} "
+              f"l1_norm_masked={r['recon_l1_norm_masked']:.3e} "
+              f"mask_frac={r['mask_frac']:.3f} reblur={r['reblur_mse']:.2e}")
 
     # aggregate row
     ap_, at_ = np.concatenate(all_pred), np.concatenate(all_true)
@@ -188,6 +223,10 @@ def main():
                      theta_scatter=float(np.std(err)),
                      recon_l1=float(np.mean([per_survey[n]["recon_l1"] for n in test_set])),
                      recon_ssim=float(np.mean([per_survey[n]["recon_ssim"] for n in test_set])),
+                     recon_l1_norm_masked=float(np.mean([per_survey[n]["recon_l1_norm_masked"] for n in test_set])),
+                     recon_l1_norm_global=float(np.mean([per_survey[n]["recon_l1_norm_global"] for n in test_set])),
+                     recon_ssim_norm=float(np.mean([per_survey[n]["recon_ssim_norm"] for n in test_set])),
+                     mask_frac=float(np.mean([per_survey[n]["mask_frac"] for n in test_set])),
                      reblur_mse=float(np.mean([per_survey[n]["reblur_mse"] for n in test_set]))))
 
     df = pd.DataFrame(rows)

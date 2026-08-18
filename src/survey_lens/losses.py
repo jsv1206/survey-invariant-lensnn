@@ -17,7 +17,7 @@ import torch
 import torch.nn.functional as F
 
 
-def ssim(a, b, C1=0.01 ** 2, C2=0.03 ** 2, window=7):
+def ssim(a, b, C1=0.01 ** 2, C2=0.03 ** 2, window=7, mask=None):
     """Mean SSIM between two [B,1,H,W] images.
 
     `C1`/`C2` assume data in [0,1] (the standard SSIM convention), but these
@@ -28,6 +28,12 @@ def ssim(a, b, C1=0.01 ** 2, C2=0.03 ** 2, window=7):
     hide amplitude error); without this, measured ssim(blurred, sharp) was
     0.999993 (HST)/0.986732 (DES), i.e. saturated. `lambda_a` is unchanged --
     this is a normalization fix, not a reweighting.
+
+    `mask` (optional [B,1,H,W] bool/float) restricts the mean to the given
+    pixels, per sample, then averages across the batch -- used for the
+    masked/normalized cross-survey metrics (HANDOFF_run1.md Step 3), since
+    images are ~96-97% empty sky and an unmasked mean is mostly a trivial
+    background-agreement number.
 
     Uses a uniform window (box filter); adequate as a structural regularizer.
     """
@@ -42,7 +48,12 @@ def ssim(a, b, C1=0.01 ** 2, C2=0.03 ** 2, window=7):
     sab = F.avg_pool2d(a * b, window, 1, pad) - mu_ab
     ssim_map = ((2 * mu_ab + C1) * (2 * sab + C2)) / \
                ((mu_a2 + mu_b2 + C1) * (sa + sb + C2))
-    return ssim_map.mean()
+    if mask is None:
+        return ssim_map.mean()
+    mask = mask.to(ssim_map.dtype)
+    denom = mask.sum(dim=(1, 2, 3)).clamp_min(1.0)
+    per_sample = (ssim_map * mask).sum(dim=(1, 2, 3)) / denom
+    return per_sample.mean()
 
 
 def fft_l1(a, b):
