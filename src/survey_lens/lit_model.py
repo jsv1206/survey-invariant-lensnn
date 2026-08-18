@@ -11,6 +11,7 @@ Designed so a physicist runs experiments by flipping constructor flags:
 All loss weights (lambda_a,b,c,d) and model size (dim, depth, patch) are
 constructor args; nothing is hard-coded in the training loop.
 """
+from . import env_setup  # noqa: F401  (must precede lightning -- see data.py)
 import torch
 import lightning as L
 

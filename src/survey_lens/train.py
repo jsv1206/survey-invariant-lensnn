@@ -21,11 +21,14 @@ All metrics are written to CSV under runs/<name>/ via Lightning's CSVLogger.
 """
 
 import argparse
+
+from . import env_setup  # noqa: F401  (must precede `lightning`: it transitively
+                          # imports torchvision, which is ABI-broken in this
+                          # sandbox -- see env_setup.py's _stub_broken_torchvision)
 import lightning as L
 from lightning.pytorch.loggers import CSVLogger
 from lightning.pytorch.callbacks import ModelCheckpoint
 
-from . import env_setup  # noqa: F401
 from .data import LensDataModule
 from .lit_model import LitLensNet
 from . import surveys as SV
@@ -43,6 +46,10 @@ def main():
                     help="global fine render grid in arcsec (LEGACY). Default "
                          "None = adaptive per-sample supersampling, which "
                          "renders the requested pixel scale exactly.")
+    ap.add_argument("--cache-dir", default=None,
+                    help="directory written by cache_datasets.py (HANDOFF_run1.md "
+                         "Step 5), containing train/ and val/ subdirs. If given, "
+                         "loads the frozen split instead of re-simulating in memory.")
     # architecture
     ap.add_argument("--dim", type=int, default=128)
     ap.add_argument("--depth", type=int, default=4)
@@ -72,7 +79,8 @@ def main():
     dm = LensDataModule(
         n_train=args.n_train, n_val=args.n_val, batch_size=args.batch_size,
         fov=args.fov, fine_scale=args.fine_scale, seed=args.seed,
-        survey_configs=SV.SURVEYS if args.survey_val else None)
+        survey_configs=SV.SURVEYS if args.survey_val else None,
+        cache_dir=args.cache_dir)
 
     lit = LitLensNet(
         patch=args.patch, dim=args.dim, depth=args.depth, n_heads=args.heads,
