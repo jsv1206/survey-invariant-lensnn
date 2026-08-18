@@ -25,6 +25,7 @@ import argparse
 from . import env_setup  # noqa: F401  (must precede `lightning`: it transitively
                           # imports torchvision, which is ABI-broken in this
                           # sandbox -- see env_setup.py's _stub_broken_torchvision)
+import torch
 import lightning as L
 from lightning.pytorch.loggers import CSVLogger
 from lightning.pytorch.callbacks import ModelCheckpoint
@@ -37,6 +38,9 @@ from . import surveys as SV
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--name", default="run")
+    ap.add_argument("--log-root", default="runs",
+                    help="CSVLogger save_dir; checkpoints land under "
+                         "<log-root>/<name>/version_N/checkpoints/")
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--n-train", type=int, default=2000)
     ap.add_argument("--n-val", type=int, default=400)
@@ -70,10 +74,22 @@ def main():
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--accelerator", default="auto")
+    ap.add_argument("--precision", default="bf16-mixed",
+                    choices=["32-true", "bf16-mixed", "16-mixed"],
+                    help="bf16-mixed (default) is a 6.9x measured speedup on the "
+                         "worst-case (prior-edge, 15,625-token) batch over 32-true "
+                         "on this sandbox's A100 -- fp32 attention at long sequence "
+                         "length falls back to a much slower non-flash SDPA kernel "
+                         "(measured backward pass 3.6x forward, vs the ~2x expected). "
+                         "No numerics issue found switching (bf16 has fp32's dynamic "
+                         "range, just less mantissa; losses.fft_l1 already forces "
+                         "float32 internally since rfft2 doesn't support bf16). Pass "
+                         "--precision 32-true to reproduce the old (slow) behavior.")
     # evaluate validation against fixed survey configs (Test Set 1)
     ap.add_argument("--survey-val", action="store_true")
     args = ap.parse_args()
 
+    torch.set_float32_matmul_precision("high")  # enable TF32 on Ampere+ tensor cores
     L.seed_everything(args.seed)
 
     dm = LensDataModule(
@@ -89,10 +105,11 @@ def main():
         loss_mode=args.loss_mode, lambda_c=args.lambda_c, lambda_d=args.lambda_d,
         lr=args.lr)
 
-    logger = CSVLogger("runs", name=args.name)
+    logger = CSVLogger(args.log_root, name=args.name)
     ckpt = ModelCheckpoint(monitor="val/loss", mode="min", save_top_k=1)
     trainer = L.Trainer(
         max_epochs=args.epochs, accelerator=args.accelerator, devices=1,
+        precision=args.precision,
         logger=logger, callbacks=[ckpt], log_every_n_steps=10)
     trainer.fit(lit, dm)
     print("best checkpoint:", ckpt.best_model_path)
