@@ -227,6 +227,12 @@ def main():
                     help="1 = no noise; 2 = realistic per-survey noise on the input")
     ap.add_argument("--out-prefix", default=None,
                     help="output file prefix (default test_set{N})")
+    ap.add_argument("--workers", type=int, default=1,
+                    help="parallelize test-set simulation across N processes "
+                         "(the simulate_one render step only; exactly reproduces "
+                         "the --workers=1 result, just faster -- see data.py's "
+                         "_render_params). Single-threaded default keeps this "
+                         "script's behavior/tests unchanged.")
     args = ap.parse_args()
 
     out_prefix = args.out_prefix or f"test_set{args.test_set}"
@@ -239,7 +245,7 @@ def main():
           f"({'no noise' if args.test_set == 1 else 'with per-survey noise'}) ...")
     test_set = builder(SV.SURVEYS, n_lenses=args.n_lenses,
                        seed=args.seed, fov=args.fov,
-                       fine_scale=args.fine_scale)
+                       fine_scale=args.fine_scale, n_workers=args.workers)
 
     per_survey, rows = {}, []
     all_pred, all_true = [], []

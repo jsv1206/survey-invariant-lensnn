@@ -10,7 +10,9 @@ A physicist editing this file:
     ADAPTIVE per-sample supersampling (exact pixel-scale fidelity; recommended)
   * use fixed survey configs -> pass `survey_configs=surveys.SURVEYS`
 """
+import functools
 import json
+import multiprocessing as mp
 import os
 
 from . import env_setup  # noqa: F401  (must precede lenstronomy/astropy AND
@@ -133,14 +135,46 @@ class SimLensDataset(Dataset):
         return it
 
 
+def _pool_worker_init():
+    """Runs once in each worker process before any task. Caps BLAS/OMP
+    threads to 1 -- parallelism already comes from the process pool itself,
+    so without this every worker would ALSO try to use the full cgroup CPU
+    quota's threads internally, oversubscribing it by a factor of n_workers
+    (same issue as cache_datasets.py; see env_setup.py). Scoped to the child
+    process only (via Pool's initializer), so the main process's own thread
+    settings (e.g. for GPU eval running concurrently) are untouched."""
+    for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ[_v] = "1"
+    from . import env_setup  # noqa: F401
+
+
+def _render_params(params_list, fov, fine_scale, n_workers=1):
+    """simulate_one(p, fov, fine_scale) for every p in params_list, in the
+    SAME ORDER as params_list. simulate_one has no internal RNG, so this is
+    exactly reproducible regardless of n_workers -- only wall time changes.
+    n_workers<=1 stays fully sequential, in-process (the default, and the
+    only path exercised by existing tests -- zero behavior change there)."""
+    if n_workers <= 1 or len(params_list) < 2:
+        return [S.simulate_one(p, fov=fov, fine_scale=fine_scale) for p in params_list]
+    ctx = mp.get_context("fork" if "fork" in mp.get_all_start_methods() else "spawn")
+    fn = functools.partial(S.simulate_one, fov=fov, fine_scale=fine_scale)
+    with ctx.Pool(processes=n_workers, initializer=_pool_worker_init) as pool:
+        return pool.map(fn, params_list)
+
+
 def build_test_set_1(survey_configs, n_lenses=200, seed=12345,
-                     fov=20.0, fine_scale=None):
+                     fov=20.0, fine_scale=None, n_workers=1):
     """Test Set 1: fixed survey configs, evaluated on the SAME underlying lenses.
 
     Draws `n_lenses` lens/source parameter sets once, then renders each lens
     through every survey's (pixel scale, PSF FWHM). This isolates cross-survey
     generalization from lens-population differences (paired comparison): a
     survey gap reflects the telescope, not a different lens sample.
+
+    `n_workers>1` parallelizes the (expensive, CPU-bound) render step across
+    a process pool -- see `_render_params`; the parameter draw itself stays
+    sequential, so the returned population is identical regardless of
+    `n_workers`, only faster.
 
     Returns: dict survey_name -> list of model-ready sample dicts (see _to_tensor),
              each also carrying 'theta_E_true' (float) for convenience.
@@ -149,11 +183,10 @@ def build_test_set_1(survey_configs, n_lenses=200, seed=12345,
     base_params = [S.sample_params(rng) for _ in range(n_lenses)]
     out = {}
     for nm, cfg in survey_configs.items():
+        params_list = [dict(bp, **cfg) for bp in base_params]   # override scale + fwhm
+        sims = _render_params(params_list, fov, fine_scale, n_workers)
         items = []
-        for bp in base_params:
-            p = dict(bp)
-            p.update(cfg)                      # override scale + fwhm only
-            o = S.simulate_one(p, fov=fov, fine_scale=fine_scale)
+        for o in sims:
             t = _to_tensor(o)
             t["theta_E_true"] = float(o["theta_E"])
             items.append(t)
@@ -162,7 +195,7 @@ def build_test_set_1(survey_configs, n_lenses=200, seed=12345,
 
 
 def build_test_set_2(survey_configs, n_lenses=200, seed=12345,
-                     fov=20.0, fine_scale=None):
+                     fov=20.0, fine_scale=None, n_workers=1):
     """Test Set 2: Test Set 1 + realistic per-survey noise on the INPUT.
 
     Identical paired design to Test Set 1 (same underlying lens population sent
@@ -176,6 +209,11 @@ def build_test_set_2(survey_configs, n_lenses=200, seed=12345,
     Test Set 2 is reproducible and uses a different stream than the lens-param
     draw. Each returned item also carries 'theta_E_true'.
 
+    `n_workers>1` parallelizes only the expensive render step (`simulate_one`,
+    no internal RNG -- see `_render_params`); the noise draw stays sequential
+    in this process, in the same (survey, base_params) order as before, so
+    the noised output is identical regardless of `n_workers`.
+
     Returns: dict survey_name -> list of model-ready sample dicts.
     """
     rng = np.random.default_rng(seed)
@@ -187,12 +225,12 @@ def build_test_set_2(survey_configs, n_lenses=200, seed=12345,
             raise ValueError(
                 f"survey '{nm}' has no noise config (bkg_rms/gain); "
                 "Test Set 2 needs surveys.SURVEYS with noise keys.")
+        params_list = [dict(bp, **cfg) for bp in base_params]
+        sims = _render_params(params_list, fov, fine_scale, n_workers)
         items = []
-        for bp in base_params:
-            p = dict(bp)
-            p.update(cfg)                      # scale + fwhm + bkg_rms + gain
-            o = S.simulate_one_noisy(p, fov=fov, fine_scale=fine_scale,
-                                     rng=noise_rng)
+        for o in sims:
+            o = dict(o)
+            o["g"] = S.add_noise(o["g"], cfg["bkg_rms"], cfg["gain"], noise_rng)
             t = _to_tensor(o)
             t["theta_E_true"] = float(o["theta_E"])
             items.append(t)

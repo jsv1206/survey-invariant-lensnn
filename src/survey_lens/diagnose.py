@@ -137,6 +137,8 @@ def main():
     ap.add_argument("--test-set", type=int, choices=[1, 2], default=1,
                     help="1 = no noise; 2 = realistic per-survey noise on the input")
     ap.add_argument("--out-prefix", default=None, help="default diag_set{N}")
+    ap.add_argument("--workers", type=int, default=1,
+                    help="parallelize test-set simulation across N processes; see test.py")
     args = ap.parse_args()
 
     out_prefix = args.out_prefix or f"diag_set{args.test_set}"
@@ -146,8 +148,8 @@ def main():
     print(f"building Test Set {args.test_set}: {args.n_lenses} lenses x "
           f"{len(SV.SURVEYS)} surveys "
           f"({'no noise' if args.test_set == 1 else 'with per-survey noise'}) ...")
-    test_set = builder(SV.SURVEYS, n_lenses=args.n_lenses,
-                       seed=args.seed, fov=args.fov, fine_scale=args.fine_scale)
+    test_set = builder(SV.SURVEYS, n_lenses=args.n_lenses, seed=args.seed,
+                       fov=args.fov, fine_scale=args.fine_scale, n_workers=args.workers)
 
     set_label = f"Test Set {args.test_set}"
     # image panels for the first n_examples lenses
