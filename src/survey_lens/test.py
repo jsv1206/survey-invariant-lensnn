@@ -101,6 +101,54 @@ def evaluate_survey(model, items, batch_size=16, device="cpu", mask_thresh=0.01)
     )
 
 
+class _FixedReconModel:
+    """model(g,h,s) stand-in that returns a FIXED reconstruction rule instead
+    of a network forward pass -- lets the zeros/identity trivial baselines
+    (HANDOFF_run1.md Step 4) reuse `evaluate_survey` exactly, so baseline and
+    trained numbers are computed identically and are directly comparable.
+    theta_E output is unused for these two (recon-only baseline rows)."""
+    def __init__(self, mode):
+        assert mode in ("zeros", "identity")
+        self.mode = mode
+
+    def __call__(self, g, h, s):
+        f_hat = torch.zeros_like(g) if self.mode == "zeros" else g
+        return dict(recon=f_hat, theta_E=torch.zeros(g.shape[0], device=g.device))
+
+
+_RECON_COLS = ("recon_l1", "recon_ssim", "recon_l1_norm_masked",
+              "recon_l1_norm_global", "recon_ssim_norm", "mask_frac", "reblur_mse")
+_THETA_COLS = ("theta_rmse", "theta_bias", "theta_scatter")
+
+
+def baseline_rows(items, batch_size=16, device="cpu"):
+    """Trivial baselines (HANDOFF_run1.md Step 4): a reviewer will ask what
+    the trained numbers mean, so report the same metrics for two null recon
+    models (zeros: f_hat=0; identity: f_hat=g, i.e. no deconvolution at all)
+    and one null regressor (prior_mean: always predict mean(theta_E), whose
+    RMSE equals the prior standard deviation by construction -- any trained
+    theta_rmse at or above it means the model learned nothing).
+
+    zeros/identity report ONLY the reconstruction columns (their theta_E
+    output is meaningless, not "trained on nothing" -- that would conflate
+    two different null hypotheses); prior_mean reports ONLY the theta
+    columns. The deconvolution claim requires beating `identity`, not merely
+    `zeros`, on the masked normalized metrics.
+    """
+    out = {}
+    for mode in ("zeros", "identity"):
+        r = evaluate_survey(_FixedReconModel(mode), items, batch_size, device)
+        out[mode] = {k: r[k] for k in _RECON_COLS}
+
+    theta_true = np.array([float(it["theta_E"]) for it in items])
+    theta_mean = float(theta_true.mean())
+    err = theta_mean - theta_true
+    out["prior_mean"] = dict(theta_rmse=float(np.sqrt(np.mean(err ** 2))),
+                             theta_bias=float(np.mean(err)),
+                             theta_scatter=float(np.std(err)))
+    return out
+
+
 def load_model(ckpt, device="cpu"):
     if ckpt and os.path.exists(ckpt):
         model = LitLensNet.load_from_checkpoint(ckpt, map_location=device)
@@ -199,7 +247,7 @@ def main():
         r = evaluate_survey(model, items, args.batch_size, args.device)
         per_survey[nm] = r
         all_pred.append(r["theta_pred"]); all_true.append(r["theta_true"])
-        rows.append(dict(survey=nm, scale=SV.SURVEYS[nm]["scale"],
+        rows.append(dict(survey=nm, model="trained", scale=SV.SURVEYS[nm]["scale"],
                          fwhm=SV.SURVEYS[nm]["fwhm"], n=r["n"],
                          theta_rmse=r["theta_rmse"], theta_bias=r["theta_bias"],
                          theta_scatter=r["theta_scatter"],
@@ -214,10 +262,21 @@ def main():
               f"l1_norm_masked={r['recon_l1_norm_masked']:.3e} "
               f"mask_frac={r['mask_frac']:.3f} reblur={r['reblur_mse']:.2e}")
 
+        # trivial baselines (HANDOFF_run1.md Step 4): same survey, same items
+        base = baseline_rows(items, args.batch_size, args.device)
+        for mode in ("zeros", "identity", "prior_mean"):
+            b = base[mode]
+            rows.append(dict(survey=nm, model=mode, scale=SV.SURVEYS[nm]["scale"],
+                             fwhm=SV.SURVEYS[nm]["fwhm"], n=r["n"],
+                             **{k: b.get(k, np.nan) for k in _THETA_COLS + _RECON_COLS}))
+        print(f"           identity beats zeros (masked normalized L1)? "
+              f"{base['identity']['recon_l1_norm_masked'] < base['zeros']['recon_l1_norm_masked']} | "
+              f"prior_mean theta_rmse={base['prior_mean']['theta_rmse']:.4f}")
+
     # aggregate row
     ap_, at_ = np.concatenate(all_pred), np.concatenate(all_true)
     err = ap_ - at_
-    rows.append(dict(survey="ALL", scale=np.nan, fwhm=np.nan, n=len(ap_),
+    rows.append(dict(survey="ALL", model="trained", scale=np.nan, fwhm=np.nan, n=len(ap_),
                      theta_rmse=float(np.sqrt(np.mean(err ** 2))),
                      theta_bias=float(np.mean(err)),
                      theta_scatter=float(np.std(err)),
