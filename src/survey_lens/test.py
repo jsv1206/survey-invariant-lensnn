@@ -34,7 +34,8 @@ from . import surveys as SV
 
 
 @torch.no_grad()
-def evaluate_survey(model, items, batch_size=16, device="cpu", mask_thresh=0.01):
+def evaluate_survey(model, items, batch_size=16, device="cpu", mask_thresh=0.01,
+                    noise_cfg=None):
     """Run the model over one survey's samples (all share grid size).
 
     Reports each reconstruction metric two ways (HANDOFF_run1.md Step 3):
@@ -46,11 +47,20 @@ def evaluate_survey(model, items, batch_size=16, device="cpu", mask_thresh=0.01)
     2.7-4.0% of pixels clear it) and over the full frame (the hallucination
     check, ~96% trivial empty-sky agreement). `mask_frac` logs the masked
     pixel fraction per sample so the global-metric dilution is visible.
+
+    `noise_cfg` (dict with 'bkg_rms'/'gain', Test Set 2 only): also computes
+    the reblur noise floor (HANDOFF_run1.md Step 9b) -- on noisy input, a
+    PERFECT reconstruction cannot drive reblur_mse to zero, since
+    `f_hat*h - g` still contains g's noise. Floor = mean(max(g,0)/gain +
+    bkg_rms**2), both globally and over the arc mask; report reblur_mse /
+    floor as the comparable diagnostic (floor itself spans ~6x across
+    surveys). Below 1.0 means the model is fitting noise, not a win.
     """
     theta_pred, theta_true = [], []
     l1_sum = ssim_sum = reblur_sum = 0.0
     l1_norm_masked_sum = l1_norm_global_sum = ssim_norm_masked_sum = 0.0
     mask_frac_sum = 0.0
+    floor_global_sum = floor_masked_sum = 0.0
     n = len(items)
     for i in range(0, n, batch_size):
         chunk = items[i:i + batch_size]
@@ -82,10 +92,16 @@ def evaluate_survey(model, items, batch_size=16, device="cpu", mask_thresh=0.01)
         ssim_norm_masked_sum += Lo.ssim(f_hat, f, mask=mask).item() * bs
         mask_frac_sum += (mask_f.sum(dim=(1, 2, 3)) / mask_f[0].numel()).sum().item()
 
+        if noise_cfg is not None:
+            var = g.clamp_min(0.0) / noise_cfg["gain"] + noise_cfg["bkg_rms"] ** 2
+            floor_global_sum += var.mean(dim=(1, 2, 3)).sum().item()
+            floor_masked_per_sample = (var * mask_f).sum(dim=(1, 2, 3)) / denom
+            floor_masked_sum += floor_masked_per_sample.sum().item()
+
     tp = torch.cat(theta_pred).numpy()
     tt = torch.cat(theta_true).numpy()
     err = tp - tt
-    return dict(
+    out = dict(
         theta_pred=tp, theta_true=tt,
         theta_rmse=float(np.sqrt(np.mean(err ** 2))),
         theta_bias=float(np.mean(err)),
@@ -99,6 +115,15 @@ def evaluate_survey(model, items, batch_size=16, device="cpu", mask_thresh=0.01)
         reblur_mse=reblur_sum / n,
         n=n,
     )
+    if noise_cfg is not None:
+        floor_global = floor_global_sum / n
+        floor_masked = floor_masked_sum / n
+        out.update(
+            reblur_floor_global=floor_global,
+            reblur_floor_masked=floor_masked,
+            reblur_mse_over_floor=out["reblur_mse"] / max(floor_global, 1e-30),
+        )
+    return out
 
 
 class _FixedReconModel:
@@ -250,23 +275,35 @@ def main():
     per_survey, rows = {}, []
     all_pred, all_true = [], []
     for nm, items in test_set.items():
-        r = evaluate_survey(model, items, args.batch_size, args.device)
+        noise_cfg = (dict(bkg_rms=SV.SURVEYS[nm]["bkg_rms"], gain=SV.SURVEYS[nm]["gain"])
+                    if args.test_set == 2 else None)
+        r = evaluate_survey(model, items, args.batch_size, args.device, noise_cfg=noise_cfg)
         per_survey[nm] = r
         all_pred.append(r["theta_pred"]); all_true.append(r["theta_true"])
-        rows.append(dict(survey=nm, model="trained", scale=SV.SURVEYS[nm]["scale"],
-                         fwhm=SV.SURVEYS[nm]["fwhm"], n=r["n"],
-                         theta_rmse=r["theta_rmse"], theta_bias=r["theta_bias"],
-                         theta_scatter=r["theta_scatter"],
-                         recon_l1=r["recon_l1"], recon_ssim=r["recon_ssim"],
-                         recon_l1_norm_masked=r["recon_l1_norm_masked"],
-                         recon_l1_norm_global=r["recon_l1_norm_global"],
-                         recon_ssim_norm=r["recon_ssim_norm"],
-                         mask_frac=r["mask_frac"],
-                         reblur_mse=r["reblur_mse"]))
+        row = dict(survey=nm, model="trained", scale=SV.SURVEYS[nm]["scale"],
+                  fwhm=SV.SURVEYS[nm]["fwhm"], n=r["n"],
+                  theta_rmse=r["theta_rmse"], theta_bias=r["theta_bias"],
+                  theta_scatter=r["theta_scatter"],
+                  recon_l1=r["recon_l1"], recon_ssim=r["recon_ssim"],
+                  recon_l1_norm_masked=r["recon_l1_norm_masked"],
+                  recon_l1_norm_global=r["recon_l1_norm_global"],
+                  recon_ssim_norm=r["recon_ssim_norm"],
+                  mask_frac=r["mask_frac"],
+                  reblur_mse=r["reblur_mse"])
+        if noise_cfg is not None:
+            row.update(reblur_floor_global=r["reblur_floor_global"],
+                      reblur_floor_masked=r["reblur_floor_masked"],
+                      reblur_mse_over_floor=r["reblur_mse_over_floor"])
+        rows.append(row)
+        floor_msg = (f" reblur/floor={r['reblur_mse_over_floor']:.2f}x"
+                    if noise_cfg is not None else "")
         print(f"  {nm:7s} theta_rmse={r['theta_rmse']:.4f} bias={r['theta_bias']:+.4f} "
               f"ssim_norm_masked={r['recon_ssim_norm']:.3f} "
               f"l1_norm_masked={r['recon_l1_norm_masked']:.3e} "
-              f"mask_frac={r['mask_frac']:.3f} reblur={r['reblur_mse']:.2e}")
+              f"mask_frac={r['mask_frac']:.3f} reblur={r['reblur_mse']:.2e}{floor_msg}")
+        if noise_cfg is not None and r["reblur_mse_over_floor"] < 1.0:
+            print(f"           WARNING: reblur_mse below the noise floor for {nm} -- "
+                  f"model may be fitting noise, not a win.")
 
         # trivial baselines (HANDOFF_run1.md Step 4): same survey, same items
         base = baseline_rows(items, args.batch_size, args.device)
@@ -282,17 +319,23 @@ def main():
     # aggregate row
     ap_, at_ = np.concatenate(all_pred), np.concatenate(all_true)
     err = ap_ - at_
-    rows.append(dict(survey="ALL", model="trained", scale=np.nan, fwhm=np.nan, n=len(ap_),
-                     theta_rmse=float(np.sqrt(np.mean(err ** 2))),
-                     theta_bias=float(np.mean(err)),
-                     theta_scatter=float(np.std(err)),
-                     recon_l1=float(np.mean([per_survey[n]["recon_l1"] for n in test_set])),
-                     recon_ssim=float(np.mean([per_survey[n]["recon_ssim"] for n in test_set])),
-                     recon_l1_norm_masked=float(np.mean([per_survey[n]["recon_l1_norm_masked"] for n in test_set])),
-                     recon_l1_norm_global=float(np.mean([per_survey[n]["recon_l1_norm_global"] for n in test_set])),
-                     recon_ssim_norm=float(np.mean([per_survey[n]["recon_ssim_norm"] for n in test_set])),
-                     mask_frac=float(np.mean([per_survey[n]["mask_frac"] for n in test_set])),
-                     reblur_mse=float(np.mean([per_survey[n]["reblur_mse"] for n in test_set]))))
+    all_row = dict(survey="ALL", model="trained", scale=np.nan, fwhm=np.nan, n=len(ap_),
+                   theta_rmse=float(np.sqrt(np.mean(err ** 2))),
+                   theta_bias=float(np.mean(err)),
+                   theta_scatter=float(np.std(err)),
+                   recon_l1=float(np.mean([per_survey[n]["recon_l1"] for n in test_set])),
+                   recon_ssim=float(np.mean([per_survey[n]["recon_ssim"] for n in test_set])),
+                   recon_l1_norm_masked=float(np.mean([per_survey[n]["recon_l1_norm_masked"] for n in test_set])),
+                   recon_l1_norm_global=float(np.mean([per_survey[n]["recon_l1_norm_global"] for n in test_set])),
+                   recon_ssim_norm=float(np.mean([per_survey[n]["recon_ssim_norm"] for n in test_set])),
+                   mask_frac=float(np.mean([per_survey[n]["mask_frac"] for n in test_set])),
+                   reblur_mse=float(np.mean([per_survey[n]["reblur_mse"] for n in test_set])))
+    if args.test_set == 2:
+        all_row.update(
+            reblur_floor_global=float(np.mean([per_survey[n]["reblur_floor_global"] for n in test_set])),
+            reblur_floor_masked=float(np.mean([per_survey[n]["reblur_floor_masked"] for n in test_set])),
+            reblur_mse_over_floor=float(np.mean([per_survey[n]["reblur_mse_over_floor"] for n in test_set])))
+    rows.append(all_row)
 
     df = pd.DataFrame(rows)
     csv_path = f"{out_prefix}_metrics.csv"
