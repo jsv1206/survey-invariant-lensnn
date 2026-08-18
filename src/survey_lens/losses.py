@@ -57,9 +57,16 @@ def ssim(a, b, C1=0.01 ** 2, C2=0.03 ** 2, window=7, mask=None):
 
 
 def fft_l1(a, b):
-    """L1 distance between magnitude spectra of two images."""
-    Fa = torch.fft.rfft2(a, norm="ortho").abs()
-    Fb = torch.fft.rfft2(b, norm="ortho").abs()
+    """L1 distance between magnitude spectra of two images.
+
+    Always computed in float32: torch.fft.rfft2 does not support bf16/fp16
+    (RuntimeError: Unsupported dtype), and under torch.autocast the inputs
+    here would otherwise arrive as whatever reduced-precision dtype the
+    upstream linear/conv layers produced -- FFT isn't in autocast's
+    auto-promoted op list, so it must be handled explicitly.
+    """
+    Fa = torch.fft.rfft2(a.float(), norm="ortho").abs()
+    Fb = torch.fft.rfft2(b.float(), norm="ortho").abs()
     return (Fa - Fb).abs().mean()
 
 

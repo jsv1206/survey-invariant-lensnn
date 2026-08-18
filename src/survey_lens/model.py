@@ -40,9 +40,14 @@ import torch.nn.functional as F
 # ---------------------------------------------------------------------------
 def build_2d_rope(positions, dim, base=10000.0):
     """
-    positions: [N, 2] physical coords (x,y) in normalized arcsec units.
+    positions: [..., N, 2] physical coords (x,y) in normalized arcsec units.
+    Leading batch dims (e.g. [B, N, 2], per-sample positions) are supported
+    via broadcasting -- see `apply_rope` and CLAUDE.md's note on per-sample
+    pixel scale: a bucket of same-npix samples does NOT guarantee identical
+    `s` (different continuous-prior draws can round to the same npix), so
+    positions must be computed per-sample, not from one shared scalar.
     dim: per-head dimension (must be divisible by 4).
-    Returns cos, sin each [N, dim], split half for x and half for y.
+    Returns cos, sin each [..., N, dim], split half for x and half for y.
     """
     assert dim % 4 == 0, "head dim must be divisible by 4 for 2D RoPE"
     d_half = dim // 2                      # half the dims for x, half for y
@@ -50,10 +55,10 @@ def build_2d_rope(positions, dim, base=10000.0):
     n_freq = d_half // 2
     idx = torch.arange(n_freq, dtype=torch.float32, device=positions.device)
     inv_freq = base ** (-idx / n_freq)     # [n_freq]
-    x = positions[:, 0:1]                  # [N,1]
-    y = positions[:, 1:2]
-    ang_x = x * inv_freq[None, :]          # [N, n_freq]
-    ang_y = y * inv_freq[None, :]
+    x = positions[..., 0:1]                # [...,N,1]
+    y = positions[..., 1:2]
+    ang_x = x * inv_freq                   # [...,N,n_freq] (broadcasts trailing dim)
+    ang_y = y * inv_freq
     # interleave-free layout: [x_freqs, y_freqs] each duplicated for (even,odd) pair
     cos = torch.cat([ang_x.cos(), ang_x.cos(), ang_y.cos(), ang_y.cos()], dim=-1)
     sin = torch.cat([ang_x.sin(), ang_x.sin(), ang_y.sin(), ang_y.sin()], dim=-1)
@@ -62,9 +67,11 @@ def build_2d_rope(positions, dim, base=10000.0):
 
 def apply_rope(t, cos, sin):
     """
-    t: [B, n_heads, N, head_dim]; cos/sin: [N, head_dim].
-    Rotates pairs (2k, 2k+1).
+    t: [B, n_heads, N, head_dim]; cos/sin: [B, N, head_dim] (per-sample
+    positions -- broadcasts over the head dimension). Rotates pairs (2k, 2k+1).
     """
+    cos = cos.unsqueeze(1)   # [B,1,N,head_dim] -> broadcasts over n_heads
+    sin = sin.unsqueeze(1)
     t1 = t[..., 0::2]
     t2 = t[..., 1::2]
     cos1 = cos[..., 0::2]
@@ -190,7 +197,13 @@ class SurveyInvariantLensNet(nn.Module):
         return x, gh, gw
 
     def _patch_positions(self, gh, gw, s, device):
-        """Physical centers of patches in normalized arcsec, origin = image center."""
+        """Physical centers of patches in normalized arcsec, origin = image
+        center, PER SAMPLE. `s`: [B] pixel scale -- a batch is bucketed by
+        matching npix, which does NOT guarantee identical `s` (different
+        continuous-prior draws can round to the same npix; measured up to
+        ~1.6% relative spread within a bucket on the real training cache),
+        so positions must vary per sample rather than use one shared scalar.
+        """
         p = self.patch
         # patch center index in pixels (centered): (k+0.5)*p - H/2
         H = gh * p
@@ -198,9 +211,12 @@ class SurveyInvariantLensNet(nn.Module):
         ii = (torch.arange(gh, device=device) + 0.5) * p - H / 2.0
         jj = (torch.arange(gw, device=device) + 0.5) * p - W / 2.0
         yy, xx = torch.meshgrid(ii, jj, indexing='ij')
-        x_arc = xx.reshape(-1) * s / self.theta_ref
-        y_arc = yy.reshape(-1) * s / self.theta_ref
-        return torch.stack([x_arc, y_arc], dim=-1)     # [nP,2]
+        xx = xx.reshape(-1)                             # [nP]
+        yy = yy.reshape(-1)
+        s = (s / self.theta_ref).view(-1, 1)             # [B,1]
+        x_arc = xx[None, :] * s                          # [B,nP]
+        y_arc = yy[None, :] * s
+        return torch.stack([x_arc, y_arc], dim=-1)       # [B,nP,2]
 
     def forward(self, g, h, s):
         """
@@ -226,12 +242,12 @@ class SurveyInvariantLensNet(nn.Module):
         img_tok = self.patch_proj(img_p) + self.type_emb(torch.zeros(1, dtype=torch.long, device=device))
         psf_tok = self.patch_proj(psf_p) + self.type_emb(torch.ones(1, dtype=torch.long, device=device))
 
-        # positions (shared across batch only if s shared; we assume per-batch equal s)
-        s_val = float(s[0].item())
-        pos = self._patch_positions(gh, gw, s_val, device)         # [nP,2]
+        # positions computed PER SAMPLE (bucketing by npix does not guarantee
+        # identical s -- see _patch_positions); also avoids a host sync from
+        # .item() on every forward call.
+        pos = self._patch_positions(gh, gw, s, device)              # [B,nP,2]
         hd = self.dim // self.blocks[0].img_self.n_heads
         cos, sin = build_2d_rope(pos, hd, base=self.rope_base)
-        cos_i = sin_i = None
         cos_i, sin_i = cos, sin
         cos_p, sin_p = cos, sin   # identical pipeline for PSF (shared frame)
 

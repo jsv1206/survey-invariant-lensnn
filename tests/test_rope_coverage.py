@@ -55,6 +55,36 @@ def test_old_default_would_fail_guard():
     assert in_field <= 4            # only 3/16 informative
 
 
+def test_rope_positions_are_per_sample_not_batch_shared():
+    """Regression: forward() used to compute RoPE positions from `s[0]` only
+    and apply them to the WHOLE batch, on the (false) assumption that
+    same-npix bucketing implies identical `s`. It does not -- different
+    continuous-prior draws can round to the same npix (measured up to ~1.6%
+    relative `s` spread within a real training-cache bucket) -- so every
+    sample but the first silently got the wrong physical pixel scale baked
+    into its positional encoding.
+
+    Two batch items with IDENTICAL image/PSF content but DIFFERENT `s` must
+    produce DIFFERENT post-attention image-token representations: under the
+    old bug, sample 1's positions would incorrectly reuse sample 0's `s`,
+    making the two (deterministic, no dropout) token trajectories identical
+    despite the differing scale.
+    """
+    torch.manual_seed(0)
+    net = SurveyInvariantLensNet(patch=4, dim=32, depth=2, n_heads=2)
+    net.eval()
+    g0 = torch.randn(1, 1, 32, 32)
+    h0 = torch.rand(1, 1, 32, 32)
+    g = g0.repeat(2, 1, 1, 1)
+    h = h0.repeat(2, 1, 1, 1)
+    s = torch.tensor([0.10, 0.16])            # same npix bucket, different scale
+    with torch.no_grad():
+        out = net(g, h, s)
+    assert not torch.allclose(out["img_tokens"][0], out["img_tokens"][1]), (
+        "identical image content with different `s` gave identical token "
+        "representations -- positions are not being computed per-sample")
+
+
 def test_rope_base_is_threaded_into_forward():
     # two models differing only in rope_base must produce different positional
     # rotations -> different outputs on the same input (proves the wiring).
