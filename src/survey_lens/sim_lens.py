@@ -62,9 +62,15 @@ def sample_params(rng):
     se1 = (1 - sq) / (1 + sq) * np.cos(2 * sphi)
     se2 = (1 - sq) / (1 + sq) * np.sin(2 * sphi)
     src_amp = float(rng.uniform(2.0, 6.0))
-    # observational
-    fwhm = _loguniform(rng, 0.1, 0.9)
-    scale = _loguniform(rng, 0.05, 0.30)
+    # observational.
+    # Bounds are deliberately WIDER than the survey configs in surveys.py so that
+    # every target survey is INTERIOR to the training prior, not on its edge:
+    #   HST  (fwhm 0.10, s 0.05 ) was on the lower edge of logU(0.1 , 0.9 )/logU(0.05, 0.30)
+    #   DES  (fwhm 0.90, s 0.263) was on the upper edge of logU(0.1 , 0.9 )
+    # One-sided training support at the extremes makes a prior-coverage artifact
+    # look like a cross-survey generalization failure. See CLAUDE.md (bug 2).
+    fwhm = _loguniform(rng, 0.08, 1.1)
+    scale = _loguniform(rng, 0.04, 0.32)
     return dict(theta_E=theta_E, e1=e1, e2=e2, gamma1=gamma1, gamma2=gamma2,
                 src_x=src_x, src_y=src_y, src_R=src_R, src_n=src_n,
                 se1=se1, se2=se2, src_amp=src_amp, fwhm=fwhm, scale=scale)
@@ -122,19 +128,52 @@ def _area_resample(img_fine, factor):
     return img.reshape(m, factor, m, factor).mean(axis=(1, 3))
 
 
-def simulate_one(params, fov=20.0, fine_scale=0.025, return_fine=False):
+def choose_supersample_factor(s_target, fwhm, factor_min=4, sigma_px_target=3.0):
+    """Integer supersampling factor for the ADAPTIVE fine grid (fine = s/factor).
+
+    Chosen per sample so that
+      (a) the sharp lens image is rendered on a grid at least `factor_min` times
+          finer than native (sub-pixel structure of the arc is resolved), and
+      (b) the PSF is resolved on the fine grid: sigma/fine >= `sigma_px_target`,
+          i.e. factor >= sigma_px_target * s / sigma. A narrow PSF at a coarse
+          native scale therefore gets a deeper supersampling.
+
+    Because `fine = s / factor` exactly divides the requested scale, the realized
+    native scale equals the requested one with NO quantization error -- unlike a
+    single global `fine_scale`, which rounds s to a multiple of itself (that is
+    dataset bug 1: it collapsed Roman 0.11" onto Euclid's 0.10" grid).
+    """
+    sigma = float(fwhm) / (2.0 * np.sqrt(2.0 * np.log(2.0)))
+    return int(max(factor_min, np.ceil(sigma_px_target * float(s_target) / sigma)))
+
+
+def simulate_one(params, fov=20.0, fine_scale=None, return_fine=False,
+                 factor_min=4, sigma_px_target=3.0):
     """
     Produce (f_gt, g, h, s, theta_E, params) at the native pixel scale.
 
-    Convolve-then-resample: render sharp at `fine_scale`, convolve with Gaussian
-    PSF at fine scale, then area-resample by the integer factor closest to
-    native scale s. The realized native scale is fine_scale * factor.
+    Convolve-then-resample: render sharp on a fine grid, convolve with the
+    Gaussian PSF at fine scale, then area-resample to the native scale.
+
+    `fine_scale=None` (DEFAULT, recommended) selects the fine grid ADAPTIVELY per
+    sample as `s / choose_supersample_factor(s, fwhm)`. This renders the
+    requested pixel scale EXACTLY (no quantization) and holds the render/PSF
+    sampling quality roughly constant across surveys, at ~2x the cost of the old
+    global 0.025" grid. Passing an explicit float reproduces the legacy
+    behaviour, where the realized scale is `fine_scale * round(s/fine_scale)`
+    and can differ from the requested `s`.
     """
     from scipy.ndimage import gaussian_filter
 
     s_target = params['scale']
-    factor = max(1, int(round(s_target / fine_scale)))
-    s = fine_scale * factor                     # realized native scale
+    if fine_scale is None:                      # adaptive: exact scale fidelity
+        factor = choose_supersample_factor(s_target, params['fwhm'],
+                                           factor_min, sigma_px_target)
+        fine_scale = s_target / factor
+        s = float(s_target)
+    else:                                       # legacy: global fine grid
+        factor = max(1, int(round(s_target / fine_scale)))
+        s = fine_scale * factor                 # realized native scale
     npix_native = int(round(fov / s))
     npix_fine = npix_native * factor
 
@@ -191,7 +230,7 @@ def add_noise(g, bkg_rms, gain, rng):
     return noisy.astype(np.float32)
 
 
-def simulate_one_noisy(params, fov=20.0, fine_scale=0.025, rng=None):
+def simulate_one_noisy(params, fov=20.0, fine_scale=None, rng=None):
     """simulate_one + add_noise on the input, using params['bkg_rms','gain'].
 
     Convenience wrapper for Test Set 2. Requires `bkg_rms` and `gain` in params
@@ -210,7 +249,7 @@ def simulate_one_noisy(params, fov=20.0, fine_scale=0.025, rng=None):
     return o
 
 
-def simulate_dataset(n, rng, fov=20.0, fine_scale=0.025):
+def simulate_dataset(n, rng, fov=20.0, fine_scale=None):
     """Generator-style list of samples (variable image sizes per sample)."""
     samples = []
     for _ in range(n):

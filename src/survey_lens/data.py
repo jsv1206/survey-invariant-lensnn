@@ -6,7 +6,8 @@ their realized pixel scale and yield batches drawn from a single bucket.
 
 A physicist editing this file:
   * change priors            -> edit sim_lens.sample_params
-  * change FOV / fine grid   -> edit `fov`, `fine_scale` below
+  * change FOV / fine grid   -> edit `fov` below; fine_scale=None means
+    ADAPTIVE per-sample supersampling (exact pixel-scale fidelity; recommended)
   * use fixed survey configs -> pass `survey_configs=surveys.SURVEYS`
 """
 import numpy as np
@@ -31,7 +32,7 @@ def _to_tensor(o):
 class SimLensDataset(Dataset):
     """Pre-simulated, in-memory dataset. Samples are bucketed by image size."""
 
-    def __init__(self, n, seed, fov=20.0, fine_scale=0.025,
+    def __init__(self, n, seed, fov=20.0, fine_scale=None,
                  survey_configs=None):
         self.fov, self.fine_scale = fov, fine_scale
         rng = np.random.default_rng(seed)
@@ -53,7 +54,7 @@ class SimLensDataset(Dataset):
 
 
 def build_test_set_1(survey_configs, n_lenses=200, seed=12345,
-                     fov=20.0, fine_scale=0.025):
+                     fov=20.0, fine_scale=None):
     """Test Set 1: fixed survey configs, evaluated on the SAME underlying lenses.
 
     Draws `n_lenses` lens/source parameter sets once, then renders each lens
@@ -81,7 +82,7 @@ def build_test_set_1(survey_configs, n_lenses=200, seed=12345,
 
 
 def build_test_set_2(survey_configs, n_lenses=200, seed=12345,
-                     fov=20.0, fine_scale=0.025):
+                     fov=20.0, fine_scale=None):
     """Test Set 2: Test Set 1 + realistic per-survey noise on the INPUT.
 
     Identical paired design to Test Set 1 (same underlying lens population sent
@@ -169,7 +170,7 @@ def collate(items):
 
 class LensDataModule(L.LightningDataModule):
     def __init__(self, n_train=512, n_val=128, batch_size=8,
-                 fov=20.0, fine_scale=0.025, seed=0, survey_configs=None):
+                 fov=20.0, fine_scale=None, seed=0, survey_configs=None):
         super().__init__()
         self.save_hyperparameters(ignore=["survey_configs"])
         self.survey_configs = survey_configs

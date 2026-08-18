@@ -140,7 +140,10 @@ def main():
     ap.add_argument("--n-lenses", type=int, default=200)
     ap.add_argument("--seed", type=int, default=12345)
     ap.add_argument("--fov", type=float, default=20.0)
-    ap.add_argument("--fine-scale", type=float, default=0.025)
+    ap.add_argument("--fine-scale", type=float, default=None,
+                    help="global fine render grid in arcsec (LEGACY). Default "
+                         "None = adaptive per-sample supersampling, which "
+                         "renders the requested pixel scale exactly.")
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--test-set", type=int, choices=[1, 2], default=1,

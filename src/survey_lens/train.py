@@ -39,7 +39,10 @@ def main():
     ap.add_argument("--n-val", type=int, default=400)
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--fov", type=float, default=20.0)
-    ap.add_argument("--fine-scale", type=float, default=0.025)
+    ap.add_argument("--fine-scale", type=float, default=None,
+                    help="global fine render grid in arcsec (LEGACY). Default "
+                         "None = adaptive per-sample supersampling, which "
+                         "renders the requested pixel scale exactly.")
     # architecture
     ap.add_argument("--dim", type=int, default=128)
     ap.add_argument("--depth", type=int, default=4)
