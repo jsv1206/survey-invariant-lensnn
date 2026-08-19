@@ -1,3 +1,52 @@
+> # ⚠ CORRECTION (2026-08-19) — read this before anything below
+>
+> **The reconstruction conclusions in this document are retracted.** Section 2 and
+> bullet 2 of "Bottom line for the paper" are **SUPERSEDED**. The θ_E results
+> (§1, §3, and the whole Test Set 2 section) are unaffected and stand.
+>
+> **What went wrong.** The deconvolution verdict was adjudicated with masked
+> normalized L1 and SSIM — precisely the metrics `CLAUDE.md:187-189` and
+> `HANDOFF_run1.md:418-430` say cannot decide it ("Global PSNR hides the
+> deconvolution effect… Deconvolution means beating `identity` in the top octave
+> specifically"). The prescribed metric, top-octave power-spectrum error, had
+> never been implemented — it was specified in Step 10, which was never reached.
+> It now exists in `survey_lens/metrics.py`.
+>
+> **The measured truth** (200-lens Test Set 1, top-octave complex error; `f_hat=0`
+> scores exactly **1.0**, so anything above 1.0 is *worse than emitting nothing*):
+>
+> | survey | trained | identity | Wiener | trained coherence | identity coherence |
+> |---|---|---|---|---|---|
+> | HST | **2.705** | 0.589 | 0.026 | 0.347 | 0.900 |
+> | Euclid | **1.354** | 0.411 | 0.036 | 0.434 | 0.932 |
+> | Roman | 0.949 | 0.166 | 0.093 | 0.444 | 0.976 |
+> | Rubin | 0.940 | 0.961 | 0.315 | 0.281 | 0.615 |
+> | DES | 0.937 | 0.959 | 0.328 | 0.285 | 0.587 |
+>
+> - `identity` — doing nothing — beats the trained model in **all five** surveys.
+> - HST and Euclid are **worse than emitting nothing**.
+> - A three-line classical Wiener filter with the same known PSF beats the
+>   network by 3-30x everywhere.
+>
+> **The most dangerous sentence in this document is not the one §2 flags.** §2's
+> verdict happens to be directionally right. The genuinely *false* claims are in
+> §2's interpretation and in "Bottom line" bullet 2: *"for Rubin/DES the network's
+> deconvolution genuinely helps"* and *"the model deconvolves effectively where
+> the PSF is a real obstacle"*. Measured at DES, top-octave coherence is 0.285
+> for the network against 0.419-0.587 for identity. **The network
+> under-deconvolves worst exactly where this document claims it succeeds.** That
+> sentence was headed for the paper.
+>
+> The "Qualitative" section's inference of "genuine deconvolution, not just
+> denoising" from eyeballing panels is likewise contradicted by the numbers.
+>
+> **Root causes** (all measured, see the plan file): the decoder had no residual
+> path to `identity`, a LayerNorm before the head destroyed absolute amplitude,
+> no non-negativity (~40% of output pixels negative), raw un-normalized input
+> left image content at 0.6% of token energy at HST vs 6.5% at DES, the loss was
+> 92% SSIM with the headline reblur term at 0.42%, and half the RoPE frequency
+> bank was silently dead. Run 2 addresses these.
+
 # Run 1 summary — Test Set 1 (no noise) + Test Set 2 (noise shift)
 
 Checkpoint: `runs/run1_full/version_0/checkpoints/epoch=54-step=79585.ckpt`
@@ -30,6 +79,10 @@ it by nearly an order of magnitude or more. This is the paper's strongest
 single result.
 
 ## 2. Does the reconstruction beat `identity` (masked, normalized) in every survey?
+
+> **SUPERSEDED — see the Correction at the top.** Adjudicated with a metric the
+> project docs disallow for this purpose. The interpretation below ("for
+> Rubin/DES the network's deconvolution genuinely helps") is measurably FALSE.
 
 **No — mixed, and the failure mode is not the one anticipated.** The
 concern going in was that a network might merely denoise/smooth without
@@ -99,6 +152,10 @@ mostly isn't (space-based)."
 
 ## Qualitative (diagnose.py panels, 3 example lenses)
 
+> **SUPERSEDED in part — see the Correction at the top.** The inference of
+> "genuine deconvolution, not just denoising" is contradicted by the
+> top-octave measurements.
+
 All three example lenses show the same pattern: HST/Euclid/Roman
 reconstructions are visually near-identical to the sharp truth with residual
 error concentrated at the single brightest knot; Rubin/DES inputs are
@@ -115,7 +172,7 @@ for Rubin/DES above.
 - **Headline result: θ_E regression is strongly survey-invariant** (8.5-17x
   over baseline in every survey, RMSE varying only 2x across a 5.3x
   pixel-scale range). This is solid and should lead the results section.
-- **Reconstruction/deconvolution claim needs a qualified statement**, not a
+- **[SUPERSEDED — see Correction] Reconstruction/deconvolution claim needs a qualified statement**, not a
   blanket one: real, measurable deconvolution gain shows up specifically
   where the PSF is a real obstacle (Rubin, DES); for the sharp surveys the
   network is architecturally capable (panels look excellent) but the
