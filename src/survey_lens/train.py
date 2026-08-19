@@ -21,6 +21,7 @@ All metrics are written to CSV under runs/<name>/ via Lightning's CSVLogger.
 """
 
 import argparse
+import os
 
 from . import env_setup  # noqa: F401  (must precede `lightning`: it transitively
                           # imports torchvision, which is ABI-broken in this
@@ -41,6 +42,14 @@ def main():
     ap.add_argument("--log-root", default="runs",
                     help="CSVLogger save_dir; checkpoints land under "
                          "<log-root>/<name>/version_N/checkpoints/")
+    ap.add_argument("--version", type=int, default=0,
+                    help="logger version dir. Pinned (not auto-incrementing) so a "
+                         "resumed run appends to the same metrics.csv.")
+    ap.add_argument("--resume", default=None,
+                    help="path to a .ckpt to resume from, or 'auto' to pick up "
+                         "<log-root>/<name>/version_<version>/checkpoints/last.ckpt "
+                         "if it exists. Restores optimizer + LR schedule + epoch, so "
+                         "pass the SAME --epochs as the original run.")
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--n-train", type=int, default=2000)
     ap.add_argument("--n-val", type=int, default=400)
@@ -116,7 +125,34 @@ def main():
         lambda_c=args.lambda_c, lambda_d=args.lambda_d,
         lr=args.lr, max_epochs=args.epochs)
 
-    logger = CSVLogger(args.log_root, name=args.name)
+    # `--resume` restores model AND optimizer AND LR-scheduler AND epoch
+    # counter, so the cosine schedule continues correctly rather than
+    # restarting. Pass the SAME --epochs as the original run or the cosine
+    # T_max changes and the schedule is silently different.
+    resume = args.resume
+    if resume == "auto":
+        cand = os.path.join(args.log_root, args.name, f"version_{args.version}",
+                            "checkpoints", "last.ckpt")
+        resume = cand if os.path.exists(cand) else None
+        print(f"--resume auto: {'resuming from ' + resume if resume else 'no last.ckpt, starting fresh'}")
+
+    # Pin the logger version so a resumed run writes into the SAME directory
+    # instead of silently starting version_1 and splitting the training curve
+    # across two files.
+    #
+    # BUT: Lightning's CSVLogger DELETES an existing metrics.csv in that
+    # directory ("Previous log files in this directory will be deleted when the
+    # new ones are saved!") and then writes only the epochs from THIS process.
+    # Resuming would therefore destroy the pre-interruption training curve --
+    # verified by actually resuming a run and watching metrics.csv disappear.
+    # Snapshot it first; stitch the parts together when analysing.
+    _mcsv = os.path.join(args.log_root, args.name, f"version_{args.version}", "metrics.csv")
+    if resume and os.path.exists(_mcsv):
+        import shutil, time as _t
+        _bak = _mcsv.replace(".csv", f".pre_resume_{_t.strftime('%Y%m%dT%H%M%S')}.csv")
+        shutil.copy2(_mcsv, _bak)
+        print(f"backed up pre-resume training curve -> {_bak}")
+    logger = CSVLogger(args.log_root, name=args.name, version=args.version)
     # monitor val/l1 rather than val/loss, keep 3 + always keep last.
     # Run 1 used monitor="val/loss", save_top_k=1, no save_last. val/loss is
     # dominated by the noisiest channel (SSIM: val log-residual std 0.571 vs
@@ -128,7 +164,7 @@ def main():
         max_epochs=args.epochs, accelerator=args.accelerator, devices=1,
         precision=args.precision,
         logger=logger, callbacks=[ckpt], log_every_n_steps=10)
-    trainer.fit(lit, dm)
+    trainer.fit(lit, dm, ckpt_path=resume)
     print("best checkpoint:", ckpt.best_model_path)
     print("metrics CSV:", logger.log_dir)
 
