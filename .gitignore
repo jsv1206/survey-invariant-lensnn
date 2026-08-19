@@ -26,3 +26,4 @@ diag_*.png
 
 # OS
 .DS_Store
+figures/run1_*.png
