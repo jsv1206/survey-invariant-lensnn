@@ -30,7 +30,19 @@ from . import env_setup  # noqa: F401
 from .data import build_test_set_1, build_test_set_2
 from .lit_model import LitLensNet
 from . import losses as Lo
+from . import metrics as MET
 from . import surveys as SV
+
+# Top-octave (0.5-1.0 x Nyquist) columns -- see survey_lens/metrics.py.
+# `hf_complex_err` is the HEADLINE reconstruction number, not `hf_power_err`:
+# the power ratio is phase-blind and gameable (a reconstruction can put the
+# right amount of power in the wrong place and score ~1.0). `f_hat = 0` scores
+# hf_complex_err == 1.0 exactly, so anything above 1.0 is worse than emitting
+# nothing. `hf_harm_frac_*` exposes how much of the band is the patch-decoder
+# grid artifact rather than signal.
+_HF_KEYS = ("hf_complex_err", "hf_coherence", "hf_power_ratio", "hf_power_err",
+            "hf_complex_err_excl", "hf_coherence_excl",
+            "hf_harm_frac_hat", "hf_harm_frac_gt")
 
 
 @torch.no_grad()
@@ -61,6 +73,9 @@ def evaluate_survey(model, items, batch_size=16, device="cpu", mask_thresh=0.01,
     l1_norm_masked_sum = l1_norm_global_sum = ssim_norm_masked_sum = 0.0
     mask_frac_sum = 0.0
     floor_global_sum = floor_masked_sum = 0.0
+    hf_vals = {k: [] for k in _HF_KEYS}          # per-sample: ratios are heavy-tailed,
+    prof_acc = None                              # so we report mean AND median
+    patch = getattr(getattr(model, "net", model), "patch", 4)
     n = len(items)
     for i in range(0, n, batch_size):
         chunk = items[i:i + batch_size]
@@ -92,6 +107,15 @@ def evaluate_survey(model, items, batch_size=16, device="cpu", mask_thresh=0.01,
         ssim_norm_masked_sum += Lo.ssim(f_hat, f, mask=mask).item() * bs
         mask_frac_sum += (mask_f.sum(dim=(1, 2, 3)) / mask_f[0].numel()).sum().item()
 
+        # top-octave metrics (HANDOFF Step 10) -- the numbers that actually
+        # adjudicate the deconvolution claim
+        hm = MET.hf_power_metrics(f_hat, f, s, patch=patch)
+        for k in _HF_KEYS:
+            hf_vals[k].extend(hm[k].detach().cpu().tolist())
+        centers, ph, pg = MET.radial_power_profile(f_hat, f, s)
+        prof_acc = (centers, ph * bs, pg * bs) if prof_acc is None else (
+            centers, prof_acc[1] + ph * bs, prof_acc[2] + pg * bs)
+
         if noise_cfg is not None:
             var = g.clamp_min(0.0) / noise_cfg["gain"] + noise_cfg["bkg_rms"] ** 2
             floor_global_sum += var.mean(dim=(1, 2, 3)).sum().item()
@@ -115,6 +139,12 @@ def evaluate_survey(model, items, batch_size=16, device="cpu", mask_thresh=0.01,
         reblur_mse=reblur_sum / n,
         n=n,
     )
+    for k in _HF_KEYS:
+        v = np.asarray(hf_vals[k], dtype=float)
+        out[k] = float(np.mean(v))
+        out[k + "_median"] = float(np.median(v))
+    if prof_acc is not None:
+        out["radial_profile"] = (prof_acc[0], prof_acc[1] / n, prof_acc[2] / n)
     if noise_cfg is not None:
         floor_global = floor_global_sum / n
         floor_masked = floor_masked_sum / n
@@ -131,18 +161,31 @@ class _FixedReconModel:
     of a network forward pass -- lets the zeros/identity trivial baselines
     (HANDOFF_run1.md Step 4) reuse `evaluate_survey` exactly, so baseline and
     trained numbers are computed identically and are directly comparable.
-    theta_E output is unused for these two (recon-only baseline rows)."""
-    def __init__(self, mode):
-        assert mode in ("zeros", "identity")
+    theta_E output is unused for these (recon-only baseline rows).
+
+    `wiener` is classical Wiener deconvolution with the KNOWN PSF -- the
+    baseline a reviewer will run unprompted, and the one that decides whether
+    the network's deconvolution is a real contribution or an under-performing
+    substitute for three lines of signal processing.
+    """
+    def __init__(self, mode, K=1e-3):
+        assert mode in ("zeros", "identity", "wiener")
         self.mode = mode
+        self.K = K
 
     def __call__(self, g, h, s):
-        f_hat = torch.zeros_like(g) if self.mode == "zeros" else g
+        if self.mode == "zeros":
+            f_hat = torch.zeros_like(g)
+        elif self.mode == "identity":
+            f_hat = g
+        else:
+            f_hat = MET.wiener_deconvolve(g, h, self.K)
         return dict(recon=f_hat, theta_E=torch.zeros(g.shape[0], device=g.device))
 
 
-_RECON_COLS = ("recon_l1", "recon_ssim", "recon_l1_norm_masked",
-              "recon_l1_norm_global", "recon_ssim_norm", "mask_frac", "reblur_mse")
+_RECON_COLS = (("recon_l1", "recon_ssim", "recon_l1_norm_masked",
+               "recon_l1_norm_global", "recon_ssim_norm", "mask_frac", "reblur_mse")
+              + _HF_KEYS + tuple(k + "_median" for k in _HF_KEYS))
 _THETA_COLS = ("theta_rmse", "theta_bias", "theta_scatter")
 
 
@@ -164,6 +207,18 @@ def baseline_rows(items, batch_size=16, device="cpu"):
     for mode in ("zeros", "identity"):
         r = evaluate_survey(_FixedReconModel(mode), items, batch_size, device)
         out[mode] = {k: r[k] for k in _RECON_COLS}
+
+    # Wiener: sweep K and keep the best by masked normalized L1. Choosing K on
+    # the evaluation set is an UPPER BOUND on Wiener, i.e. deliberately
+    # generous to the baseline we are being compared against -- state this in
+    # the caption rather than quietly picking a flattering K.
+    best = None
+    for K in (1e-2, 1e-3, 1e-4, 1e-5):
+        r = evaluate_survey(_FixedReconModel("wiener", K=K), items, batch_size, device)
+        if best is None or r["recon_l1_norm_masked"] < best[1]["recon_l1_norm_masked"]:
+            best = (K, r)
+    out["wiener"] = {k: best[1][k] for k in _RECON_COLS}
+    out["wiener"]["wiener_K"] = best[0]
 
     theta_true = np.array([float(it["theta_E"]) for it in items])
     theta_mean = float(theta_true.mean())
@@ -280,16 +335,14 @@ def main():
         r = evaluate_survey(model, items, args.batch_size, args.device, noise_cfg=noise_cfg)
         per_survey[nm] = r
         all_pred.append(r["theta_pred"]); all_true.append(r["theta_true"])
+        # build from _RECON_COLS, never a hardcoded list: a hardcoded list here
+        # silently omits any newly-added metric from the TRAINED row while the
+        # baselines (which go through _RECON_COLS) still have it.
         row = dict(survey=nm, model="trained", scale=SV.SURVEYS[nm]["scale"],
                   fwhm=SV.SURVEYS[nm]["fwhm"], n=r["n"],
                   theta_rmse=r["theta_rmse"], theta_bias=r["theta_bias"],
                   theta_scatter=r["theta_scatter"],
-                  recon_l1=r["recon_l1"], recon_ssim=r["recon_ssim"],
-                  recon_l1_norm_masked=r["recon_l1_norm_masked"],
-                  recon_l1_norm_global=r["recon_l1_norm_global"],
-                  recon_ssim_norm=r["recon_ssim_norm"],
-                  mask_frac=r["mask_frac"],
-                  reblur_mse=r["reblur_mse"])
+                  **{k: r[k] for k in _RECON_COLS})
         if noise_cfg is not None:
             row.update(reblur_floor_global=r["reblur_floor_global"],
                       reblur_floor_masked=r["reblur_floor_masked"],
@@ -307,14 +360,23 @@ def main():
 
         # trivial baselines (HANDOFF_run1.md Step 4): same survey, same items
         base = baseline_rows(items, args.batch_size, args.device)
-        for mode in ("zeros", "identity", "prior_mean"):
+        for mode in ("zeros", "identity", "wiener", "prior_mean"):
             b = base[mode]
             rows.append(dict(survey=nm, model=mode, scale=SV.SURVEYS[nm]["scale"],
                              fwhm=SV.SURVEYS[nm]["fwhm"], n=r["n"],
+                             wiener_K=b.get("wiener_K", np.nan),
                              **{k: b.get(k, np.nan) for k in _THETA_COLS + _RECON_COLS}))
-        print(f"           identity beats zeros (masked normalized L1)? "
-              f"{base['identity']['recon_l1_norm_masked'] < base['zeros']['recon_l1_norm_masked']} | "
+        # the top-octave verdict, printed where it cannot be missed
+        print(f"           TOP-OCTAVE hf_complex_err (1.0 == emitting nothing): "
+              f"trained={r['hf_complex_err']:.3f} identity={base['identity']['hf_complex_err']:.3f} "
+              f"wiener={base['wiener']['hf_complex_err']:.3f} (K={base['wiener']['wiener_K']:.0e})")
+        print(f"           coherence: trained={r['hf_coherence']:.3f} "
+              f"identity={base['identity']['hf_coherence']:.3f} | "
+              f"patch-harmonic frac: recon={r['hf_harm_frac_hat']:.3f} truth={r['hf_harm_frac_gt']:.3f} | "
               f"prior_mean theta_rmse={base['prior_mean']['theta_rmse']:.4f}")
+        if r["hf_complex_err"] > 1.0:
+            print(f"           WARNING: {nm} top-octave reconstruction is WORSE THAN "
+                  f"EMITTING NOTHING (hf_complex_err={r['hf_complex_err']:.3f} > 1.0).")
 
     # aggregate row
     ap_, at_ = np.concatenate(all_pred), np.concatenate(all_true)
@@ -323,13 +385,9 @@ def main():
                    theta_rmse=float(np.sqrt(np.mean(err ** 2))),
                    theta_bias=float(np.mean(err)),
                    theta_scatter=float(np.std(err)),
-                   recon_l1=float(np.mean([per_survey[n]["recon_l1"] for n in test_set])),
-                   recon_ssim=float(np.mean([per_survey[n]["recon_ssim"] for n in test_set])),
-                   recon_l1_norm_masked=float(np.mean([per_survey[n]["recon_l1_norm_masked"] for n in test_set])),
-                   recon_l1_norm_global=float(np.mean([per_survey[n]["recon_l1_norm_global"] for n in test_set])),
-                   recon_ssim_norm=float(np.mean([per_survey[n]["recon_ssim_norm"] for n in test_set])),
-                   mask_frac=float(np.mean([per_survey[n]["mask_frac"] for n in test_set])),
-                   reblur_mse=float(np.mean([per_survey[n]["reblur_mse"] for n in test_set])))
+                   # again from _RECON_COLS, so new metrics can never be dropped here
+                   **{k: float(np.mean([per_survey[n][k] for n in test_set]))
+                      for k in _RECON_COLS})
     if args.test_set == 2:
         all_row.update(
             reblur_floor_global=float(np.mean([per_survey[n]["reblur_floor_global"] for n in test_set])),
@@ -340,6 +398,21 @@ def main():
     df = pd.DataFrame(rows)
     csv_path = f"{out_prefix}_metrics.csv"
     df.to_csv(csv_path, index=False)
+
+    # radial power profiles are arrays, so they get their own file (Step 10 Fig 4a)
+    prof_rows = []
+    for nm in test_set:
+        prof = per_survey[nm].get("radial_profile")
+        if prof is None:
+            continue
+        centers, ph, pg = prof
+        for u, a, b in zip(centers, ph, pg):
+            prof_rows.append(dict(survey=nm, model="trained", u_over_nyquist=float(u),
+                                  P_hat=float(a), P_gt=float(b)))
+    if prof_rows:
+        prof_path = f"{out_prefix}_radial_profiles.csv"
+        pd.DataFrame(prof_rows).to_csv(prof_path, index=False)
+        print(f"wrote {prof_path}")
     fig_path = f"{out_prefix}_summary.png"
     label = "Test Set 1 (no noise)" if args.test_set == 1 else "Test Set 2 (per-survey noise)"
     make_summary_figure(per_survey, fig_path, suptitle=label)

@@ -27,9 +27,11 @@ def _make_items(n_lenses=6, survey="DES"):
 def test_baseline_keys_present():
     items = _make_items(3)
     base = baseline_rows(items, batch_size=8, device="cpu")
-    assert set(base) == {"zeros", "identity", "prior_mean"}
+    assert set(base) == {"zeros", "identity", "wiener", "prior_mean"}
     for mode in ("zeros", "identity"):
         assert set(base[mode]) == set(_RECON_COLS)
+    # wiener additionally records which regularization K won the sweep
+    assert set(base["wiener"]) == set(_RECON_COLS) | {"wiener_K"}
     assert set(base["prior_mean"]) == set(_THETA_COLS)
 
 
