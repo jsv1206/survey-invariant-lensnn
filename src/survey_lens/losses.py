@@ -148,17 +148,54 @@ def reblur(f_hat, h, sigma_px_target=4.0):
     return out.transpose(0, 1)                                   # [B,1,H,W]
 
 
-def reconstruction_loss(f_hat, f_gt, lambda_a=0.5, lambda_b=0.1):
-    l1 = (f_hat - f_gt).abs().mean()
+def reconstruction_loss(f_hat, f_gt, lambda_a=0.5, lambda_b=0.1, mask_thresh=0.01):
+    """L1 + lambda_a*(1-SSIM) + lambda_b*FFT, with the L1 term peak-normalized
+    and half-weighted onto the arc.
+
+    Two measured problems with the previous plain `(f_hat-f_gt).abs().mean()`:
+
+    1. It was in RAW surface-brightness units, so its magnitude tracked survey
+       brightness: mean|f_gt| is 2.5e-4 at HST but 7.0e-3 at DES, i.e. the
+       pixel-L1 gradient was ~27x weaker on HST than on DES. For a model whose
+       central claim is survey invariance, the loss itself was survey-biased.
+    2. It was a global mean over images that are ~97% empty sky (measured
+       signal fraction 2.1-3.0%), so the arc -- the only part anyone cares
+       about -- contributed a few percent of the term.
+
+    Now: divide both images by the per-sample f_gt peak (a shared scalar, so
+    amplitude error is preserved), then average an arc-masked term with the
+    global term. The masked half puts gradient where the signal is; the global
+    half is retained deliberately as the anti-hallucination pressure that
+    stopped Run 1's decoder from filling empty sky with junk (it emitted ~40%
+    negative pixels and 1.9x the true total flux at HST).
+    """
+    peak = f_gt.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
+    a, b = f_hat / peak, f_gt / peak
+    absdiff = (a - b).abs()
+    m = (b > mask_thresh).to(absdiff.dtype)
+    l1_masked = ((absdiff * m).sum(dim=(1, 2, 3))
+                 / m.sum(dim=(1, 2, 3)).clamp_min(1.0)).mean()
+    l1_global = absdiff.mean()
+    l1 = 0.5 * (l1_masked + l1_global)
     s = 1.0 - ssim(f_hat, f_gt)
     ff = fft_l1(f_hat, f_gt)
     total = l1 + lambda_a * s + lambda_b * ff
-    return total, dict(l1=l1.detach(), ssim_term=s.detach(), fft=ff.detach())
+    return total, dict(l1=l1.detach(), ssim_term=s.detach(), fft=ff.detach(),
+                       l1_masked=l1_masked.detach(), l1_global=l1_global.detach())
 
 
 def reblur_loss(f_hat, h, g):
+    """Self-supervised data consistency ||f_hat * h - g||^2, made SCALE-FREE.
+
+    As a raw MSE on surface brightness this term was ~1e-4 in absolute value
+    and contributed 0.42% of the training loss (0.08% on validation) at
+    lambda_c=1.0 -- i.e. the paper's headline sim-to-real contribution carried
+    essentially no gradient, and its weight silently varied with survey
+    brightness. Dividing by mean(g^2) makes it a relative residual, so one
+    lambda_c means the same thing for every survey.
+    """
     g_hat = reblur(f_hat, h)
-    return F.mse_loss(g_hat, g)
+    return F.mse_loss(g_hat, g) / (g ** 2).mean().clamp_min(1e-12)
 
 
 def regression_loss(theta_hat, theta_true):

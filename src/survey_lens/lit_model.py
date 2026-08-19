@@ -29,10 +29,23 @@ class LitLensNet(L.LightningModule):
                  loss_mode="joint",          # "joint" | "recon_only" | "reg_only"
                  lambda_a=0.5,               # SSIM weight inside recon
                  lambda_b=0.1,               # FFT weight inside recon
-                 lambda_c=1.0,               # reblur consistency weight
+                 # lambda_c 1.0 -> 0.1 (Aug 2026), together with making
+                 # `losses.reblur_loss` scale-free. Measured budget in Run 1 was
+                 # SSIM 92.3% / L1 3.5% / FFT 1.1% / reblur 0.42% / reg 2.7%:
+                 # the paper's headline self-supervised term had no gradient at
+                 # all, and its weight drifted with survey brightness. As a
+                 # relative residual it is ~170x larger, so lambda_c=1.0 would
+                 # swing it to ~72% of the post-warmup budget -- which would be
+                 # actively harmful: CLAUDE.md notes the reblur term is "nearly
+                 # blind in the blur operator's null space", i.e. it is
+                 # satisfied by ANY amount of over-smoothing, and
+                 # under-deconvolution is already the measured failure mode.
+                 # 0.1 puts it at ~20-25% of the reconstruction budget: a real
+                 # data-consistency constraint, not a smoothing incentive.
+                 lambda_c=0.1,               # reblur consistency weight (scale-free)
                  lambda_d=1.0,               # regression weight
                  # --- optimization ---
-                 lr=3e-4, weight_decay=1e-4):
+                 lr=3e-4, weight_decay=1e-4, max_epochs=60):
         super().__init__()
         self.save_hyperparameters()
         self.net = SurveyInvariantLensNet(
@@ -90,5 +103,18 @@ class LitLensNet(L.LightningModule):
         return self._step(batch, "val")
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(self.parameters(), lr=self.hparams.lr,
-                                 weight_decay=self.hparams.weight_decay)
+        """AdamW + cosine decay to ~0.
+
+        Run 1 used a bare constant lr=3e-4 for 60 epochs with no schedule, and
+        the consequence was measurable: val/loss over epochs 50-59 had a
+        coefficient of variation of 43% (a 4.3x spread), and the mean
+        epoch-to-epoch swing EXCEEDED the block-to-block improvement -- so the
+        saved "best" checkpoint (epoch 54) was a downward noise excursion
+        rather than a better model. Decaying the lr to zero makes "best" and
+        "last" converge and makes checkpoint selection mean something.
+        """
+        opt = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr,
+                                weight_decay=self.hparams.weight_decay)
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=max(1, int(self.hparams.max_epochs)), eta_min=self.hparams.lr * 1e-2)
+        return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "interval": "epoch"}}

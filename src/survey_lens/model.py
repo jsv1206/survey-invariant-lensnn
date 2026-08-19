@@ -59,9 +59,23 @@ def build_2d_rope(positions, dim, base=10000.0):
     y = positions[..., 1:2]
     ang_x = x * inv_freq                   # [...,N,n_freq] (broadcasts trailing dim)
     ang_y = y * inv_freq
-    # interleave-free layout: [x_freqs, y_freqs] each duplicated for (even,odd) pair
-    cos = torch.cat([ang_x.cos(), ang_x.cos(), ang_y.cos(), ang_y.cos()], dim=-1)
-    sin = torch.cat([ang_x.sin(), ang_x.sin(), ang_y.sin(), ang_y.sin()], dim=-1)
+    # INTERLEAVED layout: slot pair (2k, 2k+1) carries band k, matching how
+    # `apply_rope` indexes with [..., 0::2] / [..., 1::2].
+    #
+    # This previously used `cat([ang_x, ang_x, ang_y, ang_y])` -- a
+    # concatenate-duplicate layout -- while `apply_rope` used interleaved-pair
+    # indexing. The two conventions are incompatible, and the result was that
+    # only the EVEN-indexed bands were ever applied: verified numerically at
+    # head_dim=32, slots consumed {x0,x2,x4,x6,y0,y2,y4,y6} and bands
+    # {1,3,5,7} of each axis were computed and then silently discarded. Half
+    # the positional frequency bank was dead, each surviving band applied
+    # twice, leaving only three in-field wavelengths per axis. The rotation
+    # itself stayed valid (both channels of a pair shared an angle), which is
+    # why nothing downstream ever failed loudly.
+    cos = torch.cat([ang_x.cos().repeat_interleave(2, dim=-1),
+                     ang_y.cos().repeat_interleave(2, dim=-1)], dim=-1)
+    sin = torch.cat([ang_x.sin().repeat_interleave(2, dim=-1),
+                     ang_y.sin().repeat_interleave(2, dim=-1)], dim=-1)
     return cos, sin
 
 
@@ -156,7 +170,7 @@ class TriAttentionBlock(nn.Module):
 # ---------------------------------------------------------------------------
 class SurveyInvariantLensNet(nn.Module):
     def __init__(self, patch=4, dim=128, depth=4, n_heads=4,
-                 theta_ref=0.3, rope_base=100.0,
+                 theta_ref=0.45, rope_base=100.0,
                  use_cross_attention=True, mlp_ratio=4.0):
         super().__init__()
         self.patch = patch
@@ -166,21 +180,60 @@ class SurveyInvariantLensNet(nn.Module):
         # the informative bands land on sub-arcsec--to--few-arcsec structure
         # (arcs, Einstein ring theta_E~0.5-2.5"), not the >field-width scales
         # the original (theta_ref=1.0, base=1e4) wasted 13/16 bands on.
-        # See tests/test_rope_coverage.py for the coverage assertion.
+        #
+        # theta_ref raised 0.30 -> 0.45 (Aug 2026): at 0.30 the finest
+        # wavelength (2*pi*theta_ref = 1.885") was BELOW the Nyquist
+        # requirement of 2*patch*s for DES (2.104") and for the training
+        # prior's upper edge s=0.32"/px (2.560"), so the top band aliased --
+        # scale-dependent positional degradation, which is exactly what a
+        # survey-invariant model cannot afford. 0.45 gives 2.827", clear of
+        # both, and is affordable only because the layout bug in
+        # `build_2d_rope` was fixed in the same change: with all 8 bands per
+        # axis live instead of 4, in-field bands go 3 -> 4 despite the coarser
+        # finest wavelength. Strictly better on both axes.
+        # See tests/test_rope_coverage.py for both assertions.
         self.theta_ref = theta_ref
         self.rope_base = rope_base
         self.use_cross = use_cross_attention
         self.patch_dim = patch * patch
         self.patch_proj = nn.Linear(self.patch_dim, dim)   # shared img/psf projection
         self.type_emb = nn.Embedding(2, dim)               # 0=image, 1=psf
+        # Default nn.Embedding init is N(0,1), which SWAMPED the projected image
+        # content: measured signal/embedding token-energy ratio was 0.0057 at HST
+        # (i.e. the token was 99.4% constant) vs 0.065 at DES -- an 11x
+        # survey-dependent input SNR, which is precisely what a survey-invariant
+        # model must not have. Standard transformer embedding scale instead.
+        nn.init.normal_(self.type_emb.weight, std=0.02)
         self.blocks = nn.ModuleList([
             TriAttentionBlock(dim, n_heads, mlp_ratio, use_cross_attention)
             for _ in range(depth)
         ])
         self.norm = nn.LayerNorm(dim)
-        # reconstruction decoder: token -> patch pixels (same scale)
+        # Reconstruction decoder: token -> patch pixels. Takes the raw patch
+        # pixels alongside the normalized token, because `self.norm` (LayerNorm)
+        # divides out per-token amplitude -- every post-norm token has norm
+        # exactly sqrt(dim) -- while this head has to emit absolutely-scaled
+        # flux. That mismatch showed up as peak ratios falling monotonically
+        # with blur: 0.97 / 0.74 / 0.56 / 0.29 / 0.27 across the surveys.
         self.recon_head = nn.Sequential(
-            nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, self.patch_dim))
+            nn.Linear(dim + self.patch_dim, dim), nn.GELU(),
+            nn.Linear(dim, self.patch_dim))
+        # Cross-seam refinement. Each token decodes its own disjoint p x p tile
+        # with no overlap, so patch boundaries are discontinuous: measured excess
+        # boundary-step energy 1.29-1.59x vs ground truth, and for patch=4 that
+        # lands at 0.25 cyc/px == EXACTLY 0.5x Nyquist, i.e. inside the top
+        # octave that adjudicates the deconvolution claim (48.9% of HST's
+        # top-octave power was on those lines vs 21.1% for truth). 3x3 convs see
+        # across the seams.
+        self.refine = nn.Sequential(
+            nn.Conv2d(1, 16, 3, padding=1), nn.GELU(), nn.Conv2d(16, 1, 3, padding=1))
+        # ZERO-INIT both output layers => delta == 0 at init => recon == g
+        # exactly. The model therefore STARTS at the `identity` baseline and can
+        # only improve on it, instead of having to rediscover it from scratch
+        # (Run 1 never did: overfitting two images, the old decoder still landed
+        # 2.5x worse than doing nothing).
+        nn.init.zeros_(self.recon_head[-1].weight); nn.init.zeros_(self.recon_head[-1].bias)
+        nn.init.zeros_(self.refine[-1].weight); nn.init.zeros_(self.refine[-1].bias)
         # regression head: pooled image embedding + log(s) -> theta_E
         self.reg_head = nn.Sequential(
             nn.Linear(dim + 1, dim), nn.GELU(), nn.Linear(dim, dim), nn.GELU(),
@@ -227,9 +280,23 @@ class SurveyInvariantLensNet(nn.Module):
         B = g.shape[0]
         device = g.device
         H0, W0 = g.shape[-2:]
-        # pad both image and PSF to a whole number of patches (reflect padding
-        # keeps the lens-centered coordinate origin fixed: we pad on the high
-        # side only, so patch (0,0) still starts at the original corner).
+        g_in = g                                   # ORIGINAL, unpadded, unscaled
+
+        # --- per-sample input conditioning => exact scale equivariance ---
+        # Raw surface brightness is ~0.017 at HST and ~0.19 at DES, and it went
+        # straight into patch_proj, leaving image content at 0.6% of token
+        # energy at HST vs 6.5% at DES. Normalizing by a statistic of `g` ALONE
+        # (never f_gt: that would leak ground truth, and `g` is what exists on
+        # real data) and undoing it on the output makes the network exactly
+        # scale-equivariant: g -> c*g gives recon -> c*recon, by construction.
+        gscale = g.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
+        g = g / gscale
+        # PSF token stream only. `losses.reblur` still convolves with the
+        # untouched, sum-normalized `h` from the batch, so the "PSF stamps must
+        # stay sum-normalized to 1" convention is preserved where it matters.
+        h = h / h.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-12)
+
+        # pad both image and PSF to a whole number of patches (high side only)
         p = self.patch
         pad_h = (p - H0 % p) % p
         pad_w = (p - W0 % p) % p
@@ -254,15 +321,25 @@ class SurveyInvariantLensNet(nn.Module):
         img, psf = img_tok, psf_tok
         for blk in self.blocks:
             img, psf = blk(img, psf, cos_i, sin_i, cos_p, sin_p)
-        img = self.norm(img)
+        img_n = self.norm(img)
 
-        # reconstruction
-        recon_patches = self.recon_head(img)                       # [B,nP,p*p]
-        recon = self._unpatchify(recon_patches, gh, gw)
-        recon = recon[..., :H0, :W0]                               # crop to input grid
+        # --- reconstruction: a RESIDUAL on the input, not a from-scratch synthesis ---
+        # `identity` (return g) is a strong baseline precisely because the PSF
+        # attenuates high frequencies without destroying their phase, so the
+        # information is still in `g`. The old head had no path to express it and
+        # lost to identity in every survey. Predicting a correction to `g` makes
+        # identity the starting point rather than a target to rediscover.
+        # img_p is concatenated because self.norm() divides out the per-token
+        # amplitude the head needs to emit absolute flux.
+        delta = self._unpatchify(self.recon_head(torch.cat([img_n, img_p], dim=-1)),
+                                 gh, gw)[..., :H0, :W0]
+        delta = delta + self.refine(delta)                         # cross patch seams
+        # undo the input scaling (equivariance) and impose f_gt >= 0. Both output
+        # layers are zero-init, so delta == 0 and recon == g_in EXACTLY at init.
+        recon = (g_in + gscale * delta).clamp_min(0.0)
 
         # regression: mean-pool image tokens + log(s)
-        pooled = img.mean(dim=1)                                   # [B,dim]
+        pooled = img_n.mean(dim=1)                                 # [B,dim]
         logs = torch.log(s).view(B, 1)
         theta_E = self.reg_head(torch.cat([pooled, logs], dim=-1)).squeeze(-1)
         return dict(recon=recon, theta_E=theta_E, img_tokens=img, psf_tokens=psf)

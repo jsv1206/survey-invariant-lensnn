@@ -55,6 +55,54 @@ def test_old_default_would_fail_guard():
     assert in_field <= 4            # only 3/16 informative
 
 
+def test_all_frequency_bands_are_actually_applied():
+    """Every band `build_2d_rope` computes must reach the slots `apply_rope`
+    consumes.
+
+    This is the test that was missing. `build_2d_rope` used a
+    concatenate-duplicate layout while `apply_rope` indexes with [..., 0::2],
+    an interleaved-pair layout -- incompatible conventions that silently
+    discarded HALF the frequency bank (only even-indexed bands survived, each
+    applied twice, leaving three in-field wavelengths per axis). The other
+    tests in this file recompute inv_freq analytically and never call
+    apply_rope, so they were blind to it by construction.
+    """
+    head_dim = 32
+    n_freq = (head_dim // 2) // 2
+    pos = torch.tensor([[[1.0, 2.0]]])                     # one token, x=1, y=2
+    cos, sin = build_2d_rope(pos, head_dim, base=100.0)
+    used = cos[..., 0::2].flatten()                        # what apply_rope reads
+
+    idx = torch.arange(n_freq, dtype=torch.float32)
+    inv = 100.0 ** (-idx / n_freq)
+    expected = torch.cat([torch.cos(1.0 * inv), torch.cos(2.0 * inv)])
+
+    assert used.numel() == 2 * n_freq, "one slot pair per band per axis"
+    assert torch.allclose(torch.sort(used).values, torch.sort(expected).values, atol=1e-6), (
+        "the applied bands are not the full computed bank -- layout mismatch")
+    assert torch.unique(used.round(decimals=6)).numel() == used.numel(), (
+        "a band is applied more than once, so the bank is under-used")
+
+
+def test_finest_wavelength_not_aliased_at_coarsest_pixel_scale():
+    """The top RoPE band must be resolvable at the coarsest patch spacing the
+    model ever sees. Nyquist requires wavelength > 2 * patch * s_max.
+
+    With theta_ref=0.3, patch=4 and the training prior's s_max=0.32"/px, the
+    finest wavelength is 2*pi*0.3 = 1.885" against a requirement of 2.56" --
+    aliased, and aliased for DES (2.104") too. That is scale-DEPENDENT
+    positional degradation, which directly undermines the survey-invariance
+    mechanism the paper rests on.
+    """
+    net = SurveyInvariantLensNet(dim=64, n_heads=4)
+    s_max = 0.32                                            # sim_lens scale prior upper edge
+    finest = 2 * np.pi * net.theta_ref                      # inv_freq[0] == 1
+    need = 2 * net.patch * s_max
+    assert finest > need, (
+        f"finest RoPE wavelength {finest:.3f}\" aliases at s_max={s_max}\"/px "
+        f"(needs > {need:.3f}\"); raise theta_ref to > {need / (2 * np.pi):.3f}")
+
+
 def test_rope_positions_are_per_sample_not_batch_shared():
     """Regression: forward() used to compute RoPE positions from `s[0]` only
     and apply them to the WHOLE batch, on the (false) assumption that

@@ -187,6 +187,18 @@ Fix bug 9 FIRST — every pixel value depends on it.
 - **Global PSNR hides the deconvolution effect** because it behaves like the pixel-L1 term.
   Report **high-frequency (top-octave) radial power-spectrum error** as the reconstruction
   metric, alongside θ_E RMSE and the reblur residual.
+  **IMPLEMENTED (Aug 2026) in `survey_lens/metrics.py`**, wired into `test.py`. Run 1's
+  reconstruction verdict was written before this existed, using masked L1/SSIM, and was
+  wrong — see the correction banner in `figures/run1_summary.md`.
+  **A power RATIO alone is not sufficient: it is phase-blind and gameable.** Run 1 scored a
+  healthy-looking 0.86 top-octave power ratio at Euclid while being *worse than emitting
+  nothing* in phase-aware terms. Always report `hf_complex_err` (normalized so `f_hat=0`
+  scores exactly **1.0** — above 1.0 means worse than emitting nothing) and `hf_coherence`
+  alongside it. Also report `hf_harm_frac_*`: the patch decoder emits energy at the patch
+  period, which for `patch=4` is 0.25 cyc/px = **exactly 0.5× Nyquist**, i.e. inside the
+  measurement band, so the decoder's own grid can inflate the metric that judges it.
+  Compute on an **apodized centered crop, never a binary arc mask** — a hard-edged mask's
+  own spectrum falls only as k⁻³ and injects broadband top-octave power into both images.
 - **Reblur loss is nearly blind in the blur operator's null space** — re-blurring discards the
   high frequencies that deconvolution must recover. It is a data-consistency /
   anti-hallucination term, *not* a substitute for the SSIM and Fourier terms. Keep this in

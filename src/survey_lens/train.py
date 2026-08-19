@@ -59,9 +59,11 @@ def main():
     ap.add_argument("--depth", type=int, default=4)
     ap.add_argument("--heads", type=int, default=4)
     ap.add_argument("--patch", type=int, default=4)
-    ap.add_argument("--theta-ref", type=float, default=0.3,
+    ap.add_argument("--theta-ref", type=float, default=0.45,
                     help="arcsec normalization for RoPE coords; sets finest "
-                         "positional wavelength (~2*pi*theta_ref)")
+                         "positional wavelength (~2*pi*theta_ref). Must exceed "
+                         "2*patch*s_max (=2.56\" for the s=0.32\"/px prior edge) "
+                         "or the top band aliases; was 0.3 (=1.885\", aliased).")
     ap.add_argument("--rope-base", type=float, default=100.0,
                     help="RoPE frequency decay base (lower = tighter band on "
                          "in-field scales)")
@@ -69,7 +71,15 @@ def main():
     # loss
     ap.add_argument("--loss-mode", default="joint",
                     choices=["joint", "recon_only", "reg_only"])
-    ap.add_argument("--lambda-c", type=float, default=1.0, help="reblur weight")
+    ap.add_argument("--lambda-a", type=float, default=0.5,
+                    help="SSIM weight inside the reconstruction loss. Exposed so "
+                         "CLAUDE.md's documented ablation axis 4 (--lambda-a 0 "
+                         "--lambda-b 0) is actually runnable; it previously was not.")
+    ap.add_argument("--lambda-b", type=float, default=0.1, help="FFT weight inside recon")
+    ap.add_argument("--lambda-c", type=float, default=0.1,
+                    help="reblur weight. Was 1.0 against a RAW-MSE reblur term "
+                         "that contributed 0.42%% of the loss; the term is now a "
+                         "scale-free relative residual, so 0.1 puts it at ~20-25%%.")
     ap.add_argument("--lambda-d", type=float, default=1.0, help="regression weight")
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--seed", type=int, default=0)
@@ -102,11 +112,18 @@ def main():
         patch=args.patch, dim=args.dim, depth=args.depth, n_heads=args.heads,
         theta_ref=args.theta_ref, rope_base=args.rope_base,
         use_cross_attention=not args.no_cross_attention,
-        loss_mode=args.loss_mode, lambda_c=args.lambda_c, lambda_d=args.lambda_d,
-        lr=args.lr)
+        loss_mode=args.loss_mode, lambda_a=args.lambda_a, lambda_b=args.lambda_b,
+        lambda_c=args.lambda_c, lambda_d=args.lambda_d,
+        lr=args.lr, max_epochs=args.epochs)
 
     logger = CSVLogger(args.log_root, name=args.name)
-    ckpt = ModelCheckpoint(monitor="val/loss", mode="min", save_top_k=1)
+    # monitor val/l1 rather than val/loss, keep 3 + always keep last.
+    # Run 1 used monitor="val/loss", save_top_k=1, no save_last. val/loss is
+    # dominated by the noisiest channel (SSIM: val log-residual std 0.571 vs
+    # 0.116 for l1), so it selected a noise excursion -- and epoch 57, which
+    # had the lowest val/l1 of the whole run, was overwritten and is
+    # permanently unrecoverable. Do not repeat that.
+    ckpt = ModelCheckpoint(monitor="val/l1", mode="min", save_top_k=3, save_last=True)
     trainer = L.Trainer(
         max_epochs=args.epochs, accelerator=args.accelerator, devices=1,
         precision=args.precision,
