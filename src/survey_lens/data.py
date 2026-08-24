@@ -93,11 +93,29 @@ def _load_cached_sample(meta):
                 theta_E=torch.tensor(float(meta.theta_E), dtype=torch.float32))
 
 
-def load_manifest_items(cache_dir):
+def load_manifest_items(cache_dir, expect_fov=None):
     """Read one split's manifest.json into a list of `_CachedMeta` (cheap:
-    no pixel arrays touched). See `cache_datasets.py` for the manifest schema."""
+    no pixel arrays touched). See `cache_datasets.py` for the manifest schema.
+
+    `expect_fov`, if given, is checked against the manifest's own `fov` and a
+    mismatch RAISES. The cached .npz files hold only `f_gt`/`g` -- no field of
+    view, no coordinate metadata -- so nothing downstream can notice that the
+    images are on a different angular grid than the caller asked for. Before
+    this check, `train.py --fov 12 --cache-dir <a 20" cache>` trained happily
+    on 20" data and reported it as a 12" run. With caches at several FOVs
+    coexisting on disk that is a silent wrong-experiment bug, not an
+    inconvenience, so it is a hard error rather than a warning.
+    """
     with open(os.path.join(cache_dir, "manifest.json")) as f:
         manifest = json.load(f)
+    cached_fov = manifest.get("fov")
+    if expect_fov is not None and cached_fov is not None:
+        if abs(float(cached_fov) - float(expect_fov)) > 1e-6:
+            raise ValueError(
+                f"FOV mismatch: cache {cache_dir!r} was built at fov="
+                f"{float(cached_fov)}\" but fov={float(expect_fov)}\" was requested. "
+                f"Pass --fov {float(cached_fov)} to use this cache, or point "
+                f"--cache-dir at one built at {float(expect_fov)}\".")
     items = []
     for rec in manifest["samples"]:
         items.append(_CachedMeta(
@@ -118,7 +136,7 @@ class SimLensDataset(Dataset):
                  survey_configs=None, cache_dir=None):
         self.fov, self.fine_scale, self.cache_dir = fov, fine_scale, cache_dir
         if cache_dir is not None:
-            self.items = load_manifest_items(cache_dir)
+            self.items = load_manifest_items(cache_dir, expect_fov=fov)
         else:
             self.items = []
             for p in draw_params_sequence(n, seed, survey_configs):

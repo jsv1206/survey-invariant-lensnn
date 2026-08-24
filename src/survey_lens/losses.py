@@ -71,11 +71,24 @@ def fft_l1(a, b):
 
 
 def _reblur_full(f_hat, h):
-    """Reference implementation: convolve with the FULL-FOV PSF stamp, one
+    """LEGACY spatial-domain reblur: convolve with the FULL-FOV PSF stamp, one
     sample at a time. O(npix**4) per batch (the stamp is npix x npix and is
-    almost entirely zero far from center for a narrow Gaussian PSF) -- kept
-    only as the ground truth `reblur()` is checked against in tests, never
-    called from the training/eval path. See HANDOFF_run1.md Step 1.
+    almost entirely zero far from center for a narrow Gaussian PSF).
+
+    **This carries a half-pixel offset and is NOT a correctness reference.**
+    `gaussian_psf_stamp` centers the stamp on the image coordinate origin,
+    index `(npix-1)/2`, which is a half-integer whenever npix is EVEN -- which
+    it is for most survey/FOV combinations (at FOV 20" the sizes are
+    400/200/182/100/76; at FOV 12" they are 240/120/109/60/46, so only Roman
+    is odd). A convolution kernel's origin is zero
+    LAG, and integer `pad` arithmetic cannot place zero lag on a half-integer
+    index -- so this shifts the result by +0.5 px on both axes. Measured
+    against the simulator's own forward model, that inflates
+    ||f_gt * h - g||^2 / mean(g^2) from ~1e-4 to ~5e-2, i.e. 100-600x.
+
+    Kept only to reproduce pre-fix runs and to pin the regression in
+    tests/test_reblur.py. Use `reblur()`, which is exact for even and odd
+    npix alike. See CLAUDE.md bug 11.
     """
     B = f_hat.shape[0]
     outs = []
@@ -125,27 +138,57 @@ def _crop_and_renormalize(h, sigma_px_target=4.0):
 
 
 def reblur(f_hat, h, sigma_px_target=4.0):
-    """Convolve reconstruction f_hat with PSF stamp h (same-padding).
+    """Convolve reconstruction f_hat with PSF stamp h. Returns [B,1,H,W].
 
     f_hat: [B,1,H,W], h: [B,1,H,W] (same grid as f_hat, lens-centered).
-    Returns [B,1,H,W].
+    `sigma_px_target` is accepted for backwards compatibility and unused.
 
-    Crops each PSF to its effective support (~sigma_px_target sigma, from h's
-    second moment) before convolving, and does the whole batch in one grouped
-    conv2d instead of a Python loop -- the full-stamp, per-sample loop this
-    replaces costs O(npix**4) for a kernel that is almost entirely zero
-    (measured HST: a single call did not finish on CPU). Cropped-vs-full
-    agreement is <1e-6 relative; see tests/test_reblur.py and
-    HANDOFF_run1.md Step 1.
+    Done in the Fourier domain with an explicit phase ramp, because the stamp
+    is sampled on the IMAGE coordinate convention -- lag `i - (npix-1)/2` --
+    and `npix` is even for most survey/FOV combinations here (400/200/182/100/76
+    at FOV 20"; 240/120/109/60/46 at FOV 12"), so the stamp's center of
+    symmetry usually falls BETWEEN pixels -- and the parity varies with FOV, so
+    it cannot be assumed either way. A spatial conv2d can only
+    place zero lag on an integer index, so the previous cropped-kernel path
+    shifted the result by +0.5 px on both axes for every sample (see
+    `_reblur_full` and CLAUDE.md bug 11). The ramp
+    `exp(2*pi*i*((H-1)/2*ky + (W-1)/2*kx))` moves the stamp's continuous center
+    to zero lag exactly, for even and odd npix alike.
+
+    Measured against the simulator's own convolve-then-resample forward model,
+    ||reblur(f_gt,h) - g||^2 / mean(g^2) drops from ~5e-2 to 7.7e-5 (HST),
+    1.3e-4 (Euclid), 1.2e-4 (Rubin), 2.8e-4 (DES) -- i.e. this is now a
+    faithful data-consistency operator rather than a shift detector. Roman
+    lands at 3.6e-3, 4.5x above the analytic-transfer-function floor of 8.0e-4,
+    which is dataset bug 3 (PSF sigma = 0.46 native px, so the stamp aliases);
+    that residual is a stamp-sampling limit, not a centering error.
+
+    The phase ramp is exact for odd npix too, which matters because npix parity
+    depends on the FOV: shrinking 20" -> 12" turns Roman odd (182 -> 109). The
+    residuals are unchanged by that move -- 9.81e-6 / 1.61e-4 / 3.06e-5 /
+    9.31e-5 for HST/Euclid/Rubin/DES at BOTH FOVs, with Roman 1.83e-3 -> 2.07e-3
+    (its bug-3 aliasing, not a centering or wrap-around effect).
+
+    Wrap-around is not an issue at these FOVs (the arc is central and the
+    frames are ~97% empty sky): the FFT result matches a zero-padded spatial
+    conv with the same centering to the printed precision above.
     """
     B, _, H, W = f_hat.shape
-    hc = _crop_and_renormalize(h, sigma_px_target)               # [B,1,k,k]
-    kh, kw = hc.shape[-2:]
-    pad = (kw // 2, kw - 1 - kw // 2, kh // 2, kh - 1 - kh // 2)
-    x = F.pad(f_hat, pad, mode="constant")                       # [B,1,H+kh-1,W+kw-1]
-    x = x.transpose(0, 1)                                        # [1,B,H+kh-1,W+kw-1]
-    out = F.conv2d(x, hc, groups=B)                              # [1,B,H,W]
-    return out.transpose(0, 1)                                   # [B,1,H,W]
+    # FFT in fp32: bf16 autocast is active during training and torch.fft has no
+    # bf16 kernel; the reblur term is a small part of the step so this is cheap.
+    dtype_in = f_hat.dtype
+    f32 = f_hat.float()
+    h32 = h.float()
+    # PSF stamps must stay sum-normalized to 1, else the term silently rescales
+    # the reconstruction (project convention; see CLAUDE.md).
+    h32 = h32 / h32.sum(dim=(1, 2, 3), keepdim=True).clamp_min(1e-12)
+
+    ky = torch.fft.fftfreq(H, device=f_hat.device, dtype=torch.float32).view(-1, 1)
+    kx = torch.fft.fftfreq(W, device=f_hat.device, dtype=torch.float32).view(1, -1)
+    ramp = torch.exp(2j * torch.pi * (((H - 1) / 2.0) * ky + ((W - 1) / 2.0) * kx))
+
+    out = torch.fft.ifft2(torch.fft.fft2(f32) * torch.fft.fft2(h32) * ramp).real
+    return out.to(dtype_in)
 
 
 def reconstruction_loss(f_hat, f_gt, lambda_a=0.5, lambda_b=0.1, mask_thresh=0.01):

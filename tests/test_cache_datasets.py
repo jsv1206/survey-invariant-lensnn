@@ -166,3 +166,39 @@ def test_lens_data_module_rejects_size_mismatch(tmp_path):
     dm = LensDataModule(n_train=999, n_val=2, fov=FOV, cache_dir=str(tmp_path))
     with pytest.raises(ValueError):
         dm.setup()
+
+
+def test_fov_mismatch_against_cache_raises(tmp_path):
+    """A cache built at one FOV must not be silently consumed as another.
+
+    The .npz files hold only `f_gt`/`g` -- no field of view, no coordinate
+    metadata -- so without this guard `train.py --fov 12 --cache-dir <20"
+    cache>` trains on 20" images and reports a 12" run, with every downstream
+    number (token counts, mask_frac, the fixed-arcsec metric crops) quietly
+    describing the wrong geometry. Now that caches at several FOVs coexist on
+    disk this is a wrong-experiment bug, so it must be a hard error.
+    """
+    cache_flat_split("train", n=2, seed=0, fov=FOV, fine_scale=None,
+                     n_workers=2, out_root=str(tmp_path))
+    cache_dir = str(tmp_path / "train")
+
+    # matching FOV: fine
+    ds = SimLensDataset(2, seed=0, fov=FOV, cache_dir=cache_dir)
+    assert len(ds) == 2
+
+    # mismatched FOV: must raise, and must name both values
+    with pytest.raises(ValueError, match="FOV mismatch"):
+        SimLensDataset(2, seed=0, fov=FOV * 1.5, cache_dir=cache_dir)
+
+
+def test_fov_mismatch_raises_through_the_datamodule(tmp_path):
+    """The guard must fire on the path training actually uses, not just on a
+    directly-constructed dataset."""
+    cache_flat_split("train", n=2, seed=0, fov=FOV, fine_scale=None,
+                     n_workers=2, out_root=str(tmp_path))
+    cache_flat_split("val", n=2, seed=1, fov=FOV, fine_scale=None,
+                     n_workers=2, out_root=str(tmp_path))
+    dm = LensDataModule(n_train=2, n_val=2, batch_size=1, fov=FOV * 1.5,
+                        cache_dir=str(tmp_path))
+    with pytest.raises(ValueError, match="FOV mismatch"):
+        dm.setup()

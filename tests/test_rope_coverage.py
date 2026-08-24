@@ -12,6 +12,7 @@ would have FAILED on the original (theta_ref=1.0, base=1e4) defaults that put
 only 3/16 bands in range with a 6.3" finest wavelength.
 """
 import numpy as np
+import pytest
 import torch
 
 from survey_lens import env_setup  # noqa: F401
@@ -35,11 +36,22 @@ def test_default_finest_wavelength_is_subarcsec_scale():
     assert wl.min() <= 3.0, f"finest RoPE wavelength {wl.min():.2f}\" too coarse"
 
 
-def test_default_bands_land_in_field():
+@pytest.mark.parametrize("field", [20.0, 12.0])
+def test_default_bands_land_in_field(field):
+    """A healthy fraction of RoPE bands must have wavelengths that fit inside
+    the image, at every FOV the project actually trains at.
+
+    Parameterized over both FOVs because this is the assertion that binds how
+    far the field can shrink: the band wavelengths are fixed by
+    (theta_ref, rope_base) and do NOT rescale with the field, so a smaller
+    image pushes bands out the top of the range. Measured wavelengths at the
+    defaults are [2.83, 8.94, 28.27, 89.41]" -- 2 of 4 land in a 20" field and
+    the same 2 land in a 12" field, but only 1 would survive a 5" field, which
+    is one of the reasons 5" was rejected.
+    """
     net = SurveyInvariantLensNet(dim=64, n_heads=4)
     head_dim = net.dim // net.blocks[0].img_self.n_heads
     wl = _band_wavelengths(head_dim, net.theta_ref, net.rope_base)
-    field = 20.0
     finest_patch = 4 * 0.05                                  # HST patch spacing, arcsec
     in_field = ((wl >= 2 * finest_patch) & (wl <= field)).sum()
     # want a healthy fraction of bands informative, not 3/16 as in the old default

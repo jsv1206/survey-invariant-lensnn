@@ -97,3 +97,32 @@ def test_refinement_crosses_patch_seams():
         d[..., 4:8, 4:8] = 1.0
         out = net.refine(d)
     assert out[..., 3, 5].abs() > 0, "refinement does not cross the patch boundary"
+
+
+def test_zero_init_makes_recon_exactly_the_input():
+    """At init the decoder must be an exact no-op: `recon == g` bit-for-bit.
+
+    `recon_head[-1]` and `refine[-1]` are zero-initialized, so `delta` is
+    identically 0 and `recon = clamp_min(g + gscale*0, 0) == g`. This is not
+    merely cosmetic:
+
+    (a) it is why training starts from the `identity` baseline rather than from
+        noise, and
+    (b) it is what makes the `--loss-mode reg_only` ablation arm degenerate --
+        with no reconstruction loss those two layers receive no gradient ever,
+        so that arm's "reconstruction" stays exactly the input image and IS the
+        `identity` baseline. `make_ablation_figures.py` self-checks this on the
+        trained checkpoint; this test pins the mechanism it relies on.
+
+    Verified on a real reg_only-trained checkpoint: max|recon - g| = 0.0 at all
+    five surveys.
+    """
+    for n in (32, 46):                    # even, and a size needing reflect-pad
+        g, h, s = _inputs(B=2, n=n, seed=1)
+        net = SurveyInvariantLensNet(theta_ref=0.45).eval()
+        with torch.no_grad():
+            recon = net(g, h, s)["recon"]
+        dev = (recon - g).abs().max().item()
+        assert dev == 0.0, (
+            f"npix={n}: decoder is not an exact no-op at init, max|recon-g|={dev:.3e} "
+            f"-- the zero-init of recon_head[-1]/refine[-1] has been disturbed")

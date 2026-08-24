@@ -1,13 +1,23 @@
-"""Regression tests for the reblur cost fix (HANDOFF_run1.md Step 1).
+"""Regression tests for the reblur operator.
 
-`losses.reblur` used to convolve with the FULL-FOV PSF stamp per-sample in a
-Python loop: cost is npix**4, and the stamp is almost entirely zero far from
-center for a narrow Gaussian PSF. A single HST-scale (npix=400) call did not
-finish on CPU and had to be SIGKILLed. The fix crops each PSF to its
-effective support (from its own second moment) before one batched conv2d.
-These tests verify the crop preserves the loss value to <1e-6 relative
-against the (still-available, but now unused in the hot path) full reference
-implementation, and that the fix actually removes the cost blowup.
+Two separate fixes are pinned here.
+
+Step 1 (cost): `losses.reblur` used to convolve with the FULL-FOV PSF stamp
+per-sample in a Python loop -- cost npix**4 for a kernel that is almost all
+zeros. A single HST-scale (npix=400) call had to be SIGKILLed.
+
+Bug 11 (centering): the replacement cropped-kernel conv2d was fast but WRONG.
+`gaussian_psf_stamp` centers the stamp on the image coordinate origin, index
+`(npix-1)/2`, which is a half-integer because npix is even for every survey
+(400/200/182/100/76). A conv2d can only place zero lag on an integer index, so
+every reblur was shifted by +0.5 px on both axes. `losses.reblur` is now an FFT
+convolution with an explicit phase ramp, exact for even and odd npix alike.
+
+`_reblur_full` inherits the same half-pixel offset and is therefore NOT a
+correctness reference -- it is kept only to reproduce pre-fix runs and to time
+the cost regression. The real reference is the SIMULATOR's own forward model:
+simulate_one does convolve-then-resample, so `reblur(f_gt, h)` must reproduce
+its `g`. That is what `test_reblur_matches_simulator_forward_model` checks.
 """
 import time
 
@@ -26,33 +36,92 @@ FOV = 20.0
 SMALL_NPIX = 48  # >> 2*4*sigma_px+1 for every survey (max sigma_px ~1.49 px, Rubin)
 
 
-@pytest.mark.parametrize("name", list(SV.SURVEYS))
-def test_cropped_reblur_matches_full_reference(name):
-    """Cropped-kernel reblur must agree with the full-FOV reference to
-    <1e-6 relative, for every survey's PSF width (sigma_px = fwhm/2.3548/scale).
+# Measured Aug 2026: ||reblur(f_gt,h) - g||^2 / mean(g^2) against the
+# simulator's own convolve-then-resample forward model, old spatial conv2d
+# path vs the new FFT path. Roman is the outlier because its PSF sigma is
+# 0.46 native px, so the stamp itself aliases (CLAUDE.md dataset bug 3) --
+# that residual is a stamp-sampling limit, not a centering error.
+#
+#   survey   old conv    new fft    improvement
+#   HST      3.18e-02    9.81e-06      3242x
+#   Euclid   7.62e-02    1.61e-04       474x
+#   Roman    1.04e-01    1.83e-03        57x
+#   Rubin    4.75e-02    3.06e-05      1554x
+#   DES      5.13e-02    9.31e-05       551x
+FORWARD_MODEL_TOL = {
+    "HST": 1e-4, "Euclid": 1e-3, "Roman": 1e-2, "Rubin": 1e-4, "DES": 1e-3,
+}
 
-    Deliberately does NOT use each survey's real FOV npix (400 for HST) --
-    `_reblur_full` is O(npix**4) and a same-padded conv2d with an npix x npix
-    kernel forces PyTorch's CPU conv into an im2col fallback whose intermediate
-    is O(npix**4) elements. At HST scale that's ~100 GB and SIGKILLs the
-    process (see HANDOFF_run1.md Step 1) -- it doesn't just run slow, it can
-    take the whole machine down. `gaussian_psf_stamp(fwhm, scale, npix)` sets
-    sigma_px from fwhm/scale alone, so a small synthetic npix reproduces each
-    survey's exact PSF width -- and hence the exact crop window -- at safe cost.
+
+@pytest.mark.parametrize("fov", [20.0, 12.0])
+@pytest.mark.parametrize("name", list(SV.SURVEYS))
+def test_reblur_matches_simulator_forward_model(name, fov):
+    """`reblur(f_gt, h)` must reproduce the simulator's own blurred image `g`.
+
+    This is the property the reblur consistency loss actually depends on: the
+    term is ||f_hat * h - g||^2, so if the operator is mis-centered the loss
+    penalises a perfect reconstruction and rewards a shifted one. The old
+    cropped-conv path sat at ~5e-2 here -- a shift detector, not a data
+    consistency term. Tolerances are ~10x the measured values above.
+
+    Parameterized over FOV because `reblur` is an FFT convolution with NO
+    zero-padding, i.e. a CIRCULAR one, and its correctness argument is
+    explicitly conditional on the frame being mostly empty sky (`losses.py`).
+    Shrinking the field eats that margin and lets the arc wrap around the
+    boundary. Measured: at 12" the residual is essentially unchanged from 20",
+    but at 5" it reaches 1.16e-1 -- worse than the half-pixel-shifted operator
+    of bug 11 -- which is why the field was not shrunk further. This test is
+    the guard on that, so keep both FOVs in it.
+    """
+    cfg = SV.SURVEYS[name]
+    rng = np.random.default_rng(0)
+    p = S.sample_params(rng)
+    p.update(scale=cfg["scale"], fwhm=cfg["fwhm"])
+    o = S.simulate_one(p, fov=fov)
+
+    f_gt = torch.from_numpy(o["f_gt"][None, None]).float()
+    g = torch.from_numpy(o["g"][None, None]).float()
+    h = torch.from_numpy(o["h"][None, None]).float()
+
+    rel = (((Lo.reblur(f_gt, h) - g) ** 2).mean()
+           / (g ** 2).mean().clamp_min(1e-30)).item()
+    assert rel < FORWARD_MODEL_TOL[name], (
+        f"{name} @ fov={fov}\": reblur does not reproduce the simulator forward "
+        f"model, rel={rel:.2e} (tol {FORWARD_MODEL_TOL[name]:.0e})")
+
+
+@pytest.mark.parametrize("name", list(SV.SURVEYS))
+def test_reblur_is_not_half_pixel_shifted(name):
+    """Direct guard on bug 11: a centered delta must reblur to a stamp whose
+    centroid lands on the image origin (npix-1)/2, not half a pixel past it.
+
+    A delta at the coordinate origin convolved with a PSF centered on the same
+    origin must return the PSF itself, in place. The old spatial path returned
+    it shifted by +0.5 px on each axis.
     """
     cfg = SV.SURVEYS[name]
     npix = SMALL_NPIX
-    torch.manual_seed(0)
     h = torch.from_numpy(
         S.gaussian_psf_stamp(cfg["fwhm"], cfg["scale"], npix)[None, None]
-    ).float().repeat(3, 1, 1, 1)                     # batch of 3, same PSF
-    f_hat = torch.rand(3, 1, npix, npix)
+    ).float()
+    delta = torch.zeros(1, 1, npix, npix)
+    c = (npix - 1) / 2.0
+    # npix is even here, so the origin falls between pixels: split the delta
+    # over the four neighbouring pixels to place it exactly on the origin.
+    lo, hi = int(np.floor(c)), int(np.ceil(c))
+    for iy in (lo, hi):
+        for ix in (lo, hi):
+            delta[0, 0, iy, ix] = 0.25
 
-    g_full = Lo._reblur_full(f_hat, h)
-    g_crop = Lo.reblur(f_hat, h)
-
-    rel = ((g_crop - g_full).abs().max() / g_full.abs().max().clamp_min(1e-12)).item()
-    assert rel < 1e-6, f"{name}: cropped reblur diverges from full reference, rel={rel:.2e}"
+    out = Lo.reblur(delta, h)[0, 0]
+    yy, xx = torch.meshgrid(torch.arange(npix).float(),
+                            torch.arange(npix).float(), indexing="ij")
+    tot = out.sum().clamp_min(1e-12)
+    cy = (out * yy).sum() / tot
+    cx = (out * xx).sum() / tot
+    assert abs(cy.item() - c) < 0.02 and abs(cx.item() - c) < 0.02, (
+        f"{name}: reblur centroid ({cy:.3f}, {cx:.3f}) != origin {c:.3f} "
+        f"-- operator is shifted")
 
 
 def test_hst_scale_reblur_loss_completes_under_a_second():

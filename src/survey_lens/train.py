@@ -159,7 +159,15 @@ def main():
     # 0.116 for l1), so it selected a noise excursion -- and epoch 57, which
     # had the lowest val/l1 of the whole run, was overwritten and is
     # permanently unrecoverable. Do not repeat that.
-    ckpt = ModelCheckpoint(monitor="val/l1", mode="min", save_top_k=3, save_last=True)
+    # ... and the monitored key must be one THIS loss mode actually logs.
+    # `val/l1` only exists in the joint/recon_only branch (lit_model._step), so
+    # a --loss-mode reg_only run raises MisconfigurationException before it
+    # saves anything. Pick per mode. Note the arms therefore select their
+    # "best" checkpoint by different criteria, which is why the loss-mode
+    # ablation analysis uses `last.ckpt` for every arm instead -- a uniform
+    # rule -- and treats save_top_k purely as a safety net.
+    monitor = "val/l1" if args.loss_mode in ("joint", "recon_only") else "val/theta_rmse"
+    ckpt = ModelCheckpoint(monitor=monitor, mode="min", save_top_k=3, save_last=True)
     trainer = L.Trainer(
         max_epochs=args.epochs, accelerator=args.accelerator, devices=1,
         precision=args.precision,

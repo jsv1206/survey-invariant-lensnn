@@ -342,7 +342,16 @@ class SurveyInvariantLensNet(nn.Module):
         pooled = img_n.mean(dim=1)                                 # [B,dim]
         logs = torch.log(s).view(B, 1)
         theta_E = self.reg_head(torch.cat([pooled, logs], dim=-1)).squeeze(-1)
-        return dict(recon=recon, theta_E=theta_E, img_tokens=img, psf_tokens=psf)
+        # `embedding` is the POST-norm pooled feature -- exactly the vector
+        # reg_head consumes, and the one a frozen-encoder probe must read. It
+        # is deliberately not the same thing as `img_tokens`, which is returned
+        # PRE-`self.norm`: pooling those would give a probe a different feature
+        # than the head was ever trained on. Mean-pooling over the token axis
+        # is also what makes this fixed at [B,dim] even though the token count
+        # varies ~30x across pixel scales, so probe features cache as a plain
+        # [N,dim] array regardless of survey.
+        return dict(recon=recon, theta_E=theta_E, embedding=pooled,
+                    img_tokens=img, psf_tokens=psf)
 
     def _unpatchify(self, patches, gh, gw):
         B = patches.shape[0]
