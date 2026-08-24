@@ -11,12 +11,18 @@ instead of learning scale-invariant structure -- undermining the paper's
 central claim. Fix: sum instead of average. Apply to `f_gt`/`g` only, never
 to the PSF stamp `h` (which must stay `sum(h) == 1`).
 """
+
 import numpy as np
 import pytest
 
 from survey_lens import env_setup  # noqa: F401  (must precede lenstronomy)
 from survey_lens import sim_lens as S
 from survey_lens import surveys as SV
+
+# 61s of the suite's 114s -- five real lenstronomy renders at survey resolution.
+# Bug 9 is fixed and sim_lens.py is stable, so these are gated behind --runslow
+# rather than paid on every unrelated edit. See tests/conftest.py.
+pytestmark = pytest.mark.slow
 
 FOV = 20.0
 

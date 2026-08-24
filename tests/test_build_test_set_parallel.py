@@ -8,11 +8,17 @@ keeping the parameter draw (and, for Test Set 2, the noise draw) sequential,
 so the result must be byte-identical regardless of n_workers -- only wall
 time should change.
 """
+
+import pytest
 import torch
 
 from survey_lens import env_setup  # noqa: F401  (must precede lenstronomy)
-from survey_lens.data import build_test_set_1, build_test_set_2
 from survey_lens import surveys as SV
+from survey_lens.data import build_test_set_1, build_test_set_2
+
+# 9s -- builds real test sets twice (sequential vs pooled) to prove byte-identity.
+# Only meaningful when data.py's render path changes. See tests/conftest.py.
+pytestmark = pytest.mark.slow
 
 FOV = 8.0
 
