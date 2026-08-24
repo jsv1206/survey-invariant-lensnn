@@ -1,0 +1,7 @@
+survey,scale_arcsec_px,fwhm_arcsec,fov_arcsec,npix,patch,tokens_per_stream,dim,depth,n_heads,patch_dim,theta_ref,rope_base
+HST,0.05,0.1,12.0,240.0,4,3600.0,,,,,,
+Euclid,0.1,0.16,12.0,120.0,4,900.0,,,,,,
+Roman,0.11,0.12,12.0,109.0,4,784.0,,,,,,
+Rubin,0.2,0.7,12.0,60.0,4,225.0,,,,,,
+DES,0.263,0.9,12.0,46.0,4,144.0,,,,,,
+__arch__,,,12.0,,4,,128.0,4.0,4.0,16.0,0.45,100.0

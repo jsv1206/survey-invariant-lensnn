@@ -1,0 +1,85 @@
+{
+  "script": "survey_lens/make_paper_figures.py",
+  "script_version": "1.0.0",
+  "generated_utc": "2026-08-20T21:42:57Z",
+  "checkpoint": "/deepskieslab/stronglensing/survey-invariant-lensnn/runs/run2_full/version_0/checkpoints/epoch=78-step=114313.ckpt",
+  "checkpoint_sha256": "455dd16c3dd61585",
+  "git": {
+    "commit": "8051ad9dd4553248944bfe3cc70d11522787d7f5",
+    "working_tree": "dirty"
+  },
+  "test_set_1_digest": "c94992561a264fd1",
+  "test_set_2_digest": "9a97fa0472ba69b8",
+  "n_lenses": 200,
+  "seed": 12345,
+  "fov_arcsec": 20.0,
+  "surveys": {
+    "HST": {
+      "scale": 0.05,
+      "fwhm": 0.1
+    },
+    "Euclid": {
+      "scale": 0.1,
+      "fwhm": 0.16
+    },
+    "Roman": {
+      "scale": 0.11,
+      "fwhm": 0.12
+    },
+    "Rubin": {
+      "scale": 0.2,
+      "fwhm": 0.7
+    },
+    "DES": {
+      "scale": 0.263,
+      "fwhm": 0.9
+    }
+  },
+  "hero_lens_index": 154,
+  "worst_lens_index": 10,
+  "bootstrap": {
+    "n": 1000,
+    "pct": [
+      16,
+      84
+    ],
+    "seed": 0
+  },
+  "figures": {
+    "fig1_hero_grid": {
+      "pdf": "fig1_hero_grid.pdf",
+      "png": "fig1_hero_grid.png",
+      "data_csv": "fig1_hero_grid_data.csv",
+      "n_rows": 5,
+      "layout_check": "clean"
+    },
+    "fig3_survey_invariance": {
+      "pdf": "fig3_survey_invariance.pdf",
+      "png": "fig3_survey_invariance.png",
+      "data_csv": "fig3_survey_invariance_data.csv",
+      "n_rows": 15,
+      "layout_check": "clean"
+    },
+    "fig4_deconvolution": {
+      "pdf": "fig4_deconvolution.pdf",
+      "png": "fig4_deconvolution.png",
+      "data_csv": "fig4_deconvolution_data.csv",
+      "n_rows": 42,
+      "layout_check": "clean"
+    },
+    "fig5_noise_shift": {
+      "pdf": "fig5_noise_shift.pdf",
+      "png": "fig5_noise_shift.png",
+      "data_csv": "fig5_noise_shift_data.csv",
+      "n_rows": 30,
+      "layout_check": "clean"
+    },
+    "figA1_hero_grid_appendix": {
+      "pdf": "figA1_hero_grid_appendix.pdf",
+      "png": "figA1_hero_grid_appendix.png",
+      "data_csv": "figA1_hero_grid_appendix_data.csv",
+      "n_rows": 15,
+      "layout_check": "clean"
+    }
+  }
+}

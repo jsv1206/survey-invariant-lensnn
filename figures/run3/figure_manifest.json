@@ -1,0 +1,33 @@
+{
+  "script": "survey_lens/make_ablation_figures.py",
+  "script_version": "1.0.0",
+  "generated_utc": "2026-08-21T15:44:17Z",
+  "checkpoints": {
+    "joint": "/deepskieslab/stronglensing/survey-invariant-lensnn/runs/run3_joint_fov12/version_0/checkpoints/last.ckpt",
+    "recon_only": "/deepskieslab/stronglensing/survey-invariant-lensnn/runs/run3_recon_fov12/version_0/checkpoints/last.ckpt",
+    "reg_only": "/deepskieslab/stronglensing/survey-invariant-lensnn/runs/run3_reg_fov12/version_0/checkpoints/last.ckpt"
+  },
+  "git": {
+    "commit": "8051ad9dd4553248944bfe3cc70d11522787d7f5",
+    "working_tree": "dirty"
+  },
+  "fov_arcsec": 12.0,
+  "n_lenses": 200,
+  "seed": 12345,
+  "test_set_1_digest": "dbfb889d201e8ba7",
+  "test_set_2_digest": "d4723173a8169874",
+  "bootstrap": {
+    "n": 1000,
+    "seed": 0
+  },
+  "reg_only_recon_equals_identity": "CONFIRMED degenerate",
+  "figures": {
+    "fig6_loss_ablation": {
+      "pdf": "fig6_loss_ablation.pdf",
+      "png": "fig6_loss_ablation.png",
+      "data_csv": "fig6_loss_ablation_data.csv",
+      "n_rows": 45,
+      "layout_check": "clean"
+    }
+  }
+}
