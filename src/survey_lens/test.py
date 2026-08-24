@@ -67,12 +67,16 @@ def evaluate_survey(model, items, batch_size=16, device="cpu", mask_thresh=0.01,
     bkg_rms**2), both globally and over the arc mask; report reblur_mse /
     floor as the comparable diagnostic (floor itself spans ~6x across
     surveys). Below 1.0 means the model is fitting noise, not a win.
+
+    `reblur_mse_over_floor` divides by `reblur_floor_rel`, the floor in
+    `reblur_loss`'s scale-free units, NOT by the absolute `reblur_floor_global`
+    -- see the comment at the accumulation site.
     """
     theta_pred, theta_true = [], []
     l1_sum = ssim_sum = reblur_sum = 0.0
     l1_norm_masked_sum = l1_norm_global_sum = ssim_norm_masked_sum = 0.0
     mask_frac_sum = 0.0
-    floor_global_sum = floor_masked_sum = 0.0
+    floor_global_sum = floor_masked_sum = floor_rel_sum = 0.0
     hf_vals = {k: [] for k in _HF_KEYS}          # per-sample: ratios are heavy-tailed,
     prof_acc = None                              # so we report mean AND median
     patch = getattr(getattr(model, "net", model), "patch", 4)
@@ -121,6 +125,17 @@ def evaluate_survey(model, items, batch_size=16, device="cpu", mask_thresh=0.01,
             floor_global_sum += var.mean(dim=(1, 2, 3)).sum().item()
             floor_masked_per_sample = (var * mask_f).sum(dim=(1, 2, 3)) / denom
             floor_masked_sum += floor_masked_per_sample.sum().item()
+            # ... and the SAME floor expressed in reblur_loss's units. The
+            # ratio below is the headline TS2 diagnostic, and `reblur_loss` is
+            # scale-free (it divides by mean(g**2)) while `var` is an absolute
+            # surface-brightness variance -- dividing one by the other is a
+            # units error that inflates the ratio by 1/mean(g**2) (~1e6 here,
+            # which is how a sub-floor 0.13x printed as 126185x). Normalize by
+            # the batch-level mean(g**2), exactly the normalizer
+            # `losses.reblur_loss` applies, so numerator and denominator are
+            # the same quantity.
+            gsq = (g ** 2).mean().clamp_min(1e-12)
+            floor_rel_sum += (var.mean(dim=(1, 2, 3)) / gsq).sum().item()
 
     tp = torch.cat(theta_pred).numpy()
     tt = torch.cat(theta_true).numpy()
@@ -148,10 +163,13 @@ def evaluate_survey(model, items, batch_size=16, device="cpu", mask_thresh=0.01,
     if noise_cfg is not None:
         floor_global = floor_global_sum / n
         floor_masked = floor_masked_sum / n
+        floor_rel = floor_rel_sum / n
         out.update(
             reblur_floor_global=floor_global,
             reblur_floor_masked=floor_masked,
-            reblur_mse_over_floor=out["reblur_mse"] / max(floor_global, 1e-30),
+            # scale-free floor: directly comparable to `reblur_mse`
+            reblur_floor_rel=floor_rel,
+            reblur_mse_over_floor=out["reblur_mse"] / max(floor_rel, 1e-30),
         )
     return out
 
@@ -208,17 +226,49 @@ def baseline_rows(items, batch_size=16, device="cpu"):
         r = evaluate_survey(_FixedReconModel(mode), items, batch_size, device)
         out[mode] = {k: r[k] for k in _RECON_COLS}
 
-    # Wiener: sweep K and keep the best by masked normalized L1. Choosing K on
-    # the evaluation set is an UPPER BOUND on Wiener, i.e. deliberately
-    # generous to the baseline we are being compared against -- state this in
-    # the caption rather than quietly picking a flattering K.
-    best = None
-    for K in (1e-2, 1e-3, 1e-4, 1e-5):
-        r = evaluate_survey(_FixedReconModel("wiener", K=K), items, batch_size, device)
-        if best is None or r["recon_l1_norm_masked"] < best[1]["recon_l1_norm_masked"]:
-            best = (K, r)
-    out["wiener"] = {k: best[1][k] for k in _RECON_COLS}
-    out["wiener"]["wiener_K"] = best[0]
+    # Wiener: sweep K and report the baseline at its BEST K for each metric it
+    # gets quoted against -- not one K chosen on L1 and then scored on
+    # everything else.
+    #
+    # The headline deconvolution claim is `hf_complex_err`, but K used to be
+    # selected on `recon_l1_norm_masked` alone, so Wiener was being judged on a
+    # metric it had not been tuned for. That understates the baseline, and the
+    # baseline is exactly what the paper's claim rests on. Two rows now:
+    #   `wiener`     -- K best by masked normalized L1 (unchanged, for continuity)
+    #   `wiener_hf`  -- K best by top-octave complex error (the fair comparison
+    #                   for the deconvolution claim)
+    # Choosing K on the evaluation set at all is already an UPPER BOUND on
+    # Wiener, i.e. deliberately generous to the baseline; say so in the caption
+    # rather than quietly picking a flattering K.
+    #
+    # The grid spans more decades than looks necessary because the optimum was
+    # pinning to the smallest K offered (1e-5) at Rubin and DES -- an
+    # edge-pinned baseline is an under-tuned baseline, and a referee reading a
+    # "we beat Wiener" claim will check precisely this.
+    sweep = {}
+    # Grid runs to 1e-12 because on NOISE-FREE data there is no noise to
+    # amplify, so Wiener's optimum keeps sliding toward the naive inverse
+    # filter (K -> 0) until float32 FFT conditioning takes over. Stopping at
+    # 1e-5, as this sweep originally did, left Wiener badly under-tuned at the
+    # seeing-limited surveys: Rubin's top-octave error falls 0.315 -> 0.059 and
+    # DES's 0.328 -> 0.079 once the grid is allowed to reach the floor. Beyond
+    # ~1e-13 the filter diverges numerically (values in the hundreds of
+    # thousands); those K are never selected since we take the min, but they
+    # bound the grid so the optimum is INTERIOR rather than edge-pinned.
+    # The grid also runs UP to 1e+1 because on noisy data the optimum moves the
+    # other way -- Wiener needs heavy regularization there, and on Test Set 2
+    # HST/Euclid were pinning at the top of a grid that stopped at 1e-1.
+    for K in (10.0 ** -e for e in range(-1, 15)):
+        sweep[K] = evaluate_survey(_FixedReconModel("wiener", K=K), items,
+                                   batch_size, device)
+    for row, key in (("wiener", "recon_l1_norm_masked"),
+                     ("wiener_hf", "hf_complex_err")):
+        bestK = min(sweep, key=lambda K: sweep[K][key])
+        out[row] = {k: sweep[bestK][k] for k in _RECON_COLS}
+        out[row]["wiener_K"] = bestK
+        out[row]["wiener_K_selected_on"] = key
+        ks = sorted(sweep)
+        out[row]["wiener_K_at_grid_edge"] = bool(bestK in (ks[0], ks[-1]))
 
     theta_true = np.array([float(it["theta_E"]) for it in items])
     theta_mean = float(theta_true.mean())
@@ -346,6 +396,7 @@ def main():
         if noise_cfg is not None:
             row.update(reblur_floor_global=r["reblur_floor_global"],
                       reblur_floor_masked=r["reblur_floor_masked"],
+                      reblur_floor_rel=r["reblur_floor_rel"],
                       reblur_mse_over_floor=r["reblur_mse_over_floor"])
         rows.append(row)
         floor_msg = (f" reblur/floor={r['reblur_mse_over_floor']:.2f}x"
@@ -360,16 +411,20 @@ def main():
 
         # trivial baselines (HANDOFF_run1.md Step 4): same survey, same items
         base = baseline_rows(items, args.batch_size, args.device)
-        for mode in ("zeros", "identity", "wiener", "prior_mean"):
+        for mode in ("zeros", "identity", "wiener", "wiener_hf", "prior_mean"):
             b = base[mode]
             rows.append(dict(survey=nm, model=mode, scale=SV.SURVEYS[nm]["scale"],
                              fwhm=SV.SURVEYS[nm]["fwhm"], n=r["n"],
                              wiener_K=b.get("wiener_K", np.nan),
+                             wiener_K_selected_on=b.get("wiener_K_selected_on", ""),
+                             wiener_K_at_grid_edge=b.get("wiener_K_at_grid_edge", ""),
                              **{k: b.get(k, np.nan) for k in _THETA_COLS + _RECON_COLS}))
         # the top-octave verdict, printed where it cannot be missed
         print(f"           TOP-OCTAVE hf_complex_err (1.0 == emitting nothing): "
               f"trained={r['hf_complex_err']:.3f} identity={base['identity']['hf_complex_err']:.3f} "
-              f"wiener={base['wiener']['hf_complex_err']:.3f} (K={base['wiener']['wiener_K']:.0e})")
+              f"wiener_hf={base['wiener_hf']['hf_complex_err']:.3f} "
+              f"(K={base['wiener_hf']['wiener_K']:.0e}"
+              f"{', AT GRID EDGE' if base['wiener_hf']['wiener_K_at_grid_edge'] else ''})")
         print(f"           coherence: trained={r['hf_coherence']:.3f} "
               f"identity={base['identity']['hf_coherence']:.3f} | "
               f"patch-harmonic frac: recon={r['hf_harm_frac_hat']:.3f} truth={r['hf_harm_frac_gt']:.3f} | "
@@ -392,6 +447,7 @@ def main():
         all_row.update(
             reblur_floor_global=float(np.mean([per_survey[n]["reblur_floor_global"] for n in test_set])),
             reblur_floor_masked=float(np.mean([per_survey[n]["reblur_floor_masked"] for n in test_set])),
+            reblur_floor_rel=float(np.mean([per_survey[n]["reblur_floor_rel"] for n in test_set])),
             reblur_mse_over_floor=float(np.mean([per_survey[n]["reblur_mse_over_floor"] for n in test_set])))
     rows.append(all_row)
 

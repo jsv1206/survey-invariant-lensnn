@@ -27,11 +27,14 @@ def _make_items(n_lenses=6, survey="DES"):
 def test_baseline_keys_present():
     items = _make_items(3)
     base = baseline_rows(items, batch_size=8, device="cpu")
-    assert set(base) == {"zeros", "identity", "wiener", "prior_mean"}
+    assert set(base) == {"zeros", "identity", "wiener", "wiener_hf", "prior_mean"}
     for mode in ("zeros", "identity"):
         assert set(base[mode]) == set(_RECON_COLS)
-    # wiener additionally records which regularization K won the sweep
-    assert set(base["wiener"]) == set(_RECON_COLS) | {"wiener_K"}
+    # wiener additionally records which regularization K won the sweep,
+    # which metric that K was selected on, and whether it pinned to a grid edge
+    _wk = {"wiener_K", "wiener_K_selected_on", "wiener_K_at_grid_edge"}
+    for row in ("wiener", "wiener_hf"):
+        assert set(base[row]) == set(_RECON_COLS) | _wk
     assert set(base["prior_mean"]) == set(_THETA_COLS)
 
 
@@ -67,3 +70,42 @@ def test_zeros_masked_l1_exceeds_global_l1():
     items = _make_items(6)
     base = baseline_rows(items, batch_size=8, device="cpu")
     assert base["zeros"]["recon_l1_norm_masked"] > base["zeros"]["recon_l1_norm_global"]
+
+
+def test_wiener_is_tuned_on_the_metric_it_is_quoted_against():
+    """A baseline quoted against a metric must have been SELECTED on that metric.
+
+    The paper's deconvolution claim is `hf_complex_err` vs Wiener. That sweep
+    used to pick K by masked L1 and then report the resulting `hf_complex_err`,
+    i.e. Wiener was judged on a number it had never been tuned for -- which
+    understates the baseline the whole claim rests on. Measured on Run 3, fixing
+    this moved Wiener's top-octave error at Rubin from 0.315 to 0.057 and at DES
+    from 0.328 to 0.078, flipping both surveys from "network wins ~4x" to
+    "Wiener wins ~1.1x". A silent regression here would silently re-inflate the
+    paper's headline, so pin it.
+    """
+    items = _make_items(3)
+    base = baseline_rows(items, batch_size=8, device="cpu")
+
+    assert base["wiener"]["wiener_K_selected_on"] == "recon_l1_norm_masked"
+    assert base["wiener_hf"]["wiener_K_selected_on"] == "hf_complex_err"
+
+    # each row must be at least as good as the other ON ITS OWN metric --
+    # that is what "selected on" has to mean
+    assert base["wiener_hf"]["hf_complex_err"] <= base["wiener"]["hf_complex_err"] + 1e-12
+    assert (base["wiener"]["recon_l1_norm_masked"]
+            <= base["wiener_hf"]["recon_l1_norm_masked"] + 1e-12)
+
+
+def test_wiener_optimum_is_interior_to_the_sweep_grid():
+    """An edge-pinned optimum means the baseline is under-tuned, and an
+    under-tuned baseline flatters us. On noise-free data Wiener's optimum keeps
+    sliding toward the naive inverse filter (K -> 0), so a grid that stops too
+    early leaves real performance on the table; on noisy data it moves the
+    other way and wants heavy regularization. The grid has to bracket both."""
+    items = _make_items(3)
+    base = baseline_rows(items, batch_size=8, device="cpu")
+    for row in ("wiener", "wiener_hf"):
+        assert not base[row]["wiener_K_at_grid_edge"], (
+            f"{row}: best K={base[row]['wiener_K']:.0e} sits at a grid edge -- "
+            f"widen the sweep in test.baseline_rows; the optimum may be outside it")
