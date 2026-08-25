@@ -1,11 +1,11 @@
 {
   "script": "survey_lens/make_paper_figures.py",
-  "script_version": "1.2.1",
-  "generated_utc": "2026-08-24T03:29:05Z",
+  "script_version": "1.3.0",
+  "generated_utc": "2026-08-25T05:32:20Z",
   "checkpoint": "/deepskieslab/stronglensing/survey-invariant-lensnn/runs/run3_joint_fov12/version_0/checkpoints/last.ckpt",
   "checkpoint_sha256": "087e4d3ad079c4b6",
   "git": {
-    "commit": "8051ad9dd4553248944bfe3cc70d11522787d7f5",
+    "commit": "b5ac6fab82cad3559a689a5581a60ea4695956e9",
     "working_tree": "dirty"
   },
   "test_set_1_digest": "dbfb889d201e8ba7",
@@ -57,21 +57,14 @@
       "pdf": "fig3_survey_invariance.pdf",
       "png": "fig3_survey_invariance.png",
       "data_csv": "fig3_survey_invariance_data.csv",
-      "n_rows": 15,
+      "n_rows": 20,
       "layout_check": "clean"
     },
-    "fig4_deconvolution": {
-      "pdf": "fig4_deconvolution.pdf",
-      "png": "fig4_deconvolution.png",
-      "data_csv": "fig4_deconvolution_data.csv",
-      "n_rows": 42,
-      "layout_check": "clean"
-    },
-    "fig5_noise_shift": {
-      "pdf": "fig5_noise_shift.pdf",
-      "png": "fig5_noise_shift.png",
-      "data_csv": "fig5_noise_shift_data.csv",
-      "n_rows": 30,
+    "fig3_survey_invariance_noise": {
+      "pdf": "fig3_survey_invariance_noise.pdf",
+      "png": "fig3_survey_invariance_noise.png",
+      "data_csv": "fig3_survey_invariance_noise_data.csv",
+      "n_rows": 40,
       "layout_check": "clean"
     },
     "figA1_hero_grid_appendix": {

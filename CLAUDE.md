@@ -73,6 +73,37 @@ Paper figures: `figures/paper/` (mirrored to `$ROOT/figures/paper/`), produced b
 `survey_lens/make_paper_figures.py` — one re-runnable script, each figure with its
 `_data.csv`, `captions.md` and `figure_manifest.json`.
 
+## Figure set as of Aug 25 2026 — THREE figures per paper, NO appendix
+
+| | Sim2Science (5pp) | Representations (4pp) |
+|---|---|---|
+| Fig 1 | `fig1_hero_grid` | `fig1_hero_grid` |
+| Fig 2 | `fig3_survey_invariance_noise` | `fig3_survey_invariance` |
+| Fig 3 | `fig7_cross_attention` | `fig7_cross_attention` |
+
+Generated but NOT in either paper: `fig2_architecture`, `fig6_loss_ablation`,
+`figA1_hero_grid_appendix`. **Not emitted at all**: `fig4_deconvolution` (`--with-fig4`),
+`fig5_noise_shift` (`--with-fig5`).
+
+**Slug digits are historical and match NEITHER venue.** Resolve numbering with
+`\label`/`\ref`. Slugs are frozen provenance — never rename to match a venue.
+
+Read `plan_sim2science.md` for the per-figure spec and `RESULTS_SUMMARY.md` for every
+number, with the caveat attached to each. Do not re-derive numbers from the metrics CSVs
+when writing; quote `figures/run3/paper/<slug>_data.csv`.
+
+**Claims that now live ONLY in the text** because their figures were cut: the reblur
+consistency diagnostic (HST at 0.92x its own noise floor, flagged without ground truth),
+top-octave coherence (the anti-"sharpening artifact" evidence), theta_E being unaffected by
+removing cross-attention (the capacity control), and the loss-mode asymmetry.
+
+**Two figure-level bugs found and fixed in this round, worth not repeating:**
+- Fig 1's residual scale was +/-0.30, inherited from Run 2. Against Run 3 that rendered
+  three of five residual panels BLANK and hid the cross-survey ordering. Now +/-0.05.
+- Every figure shared ONE bootstrap generator, so intervals depended on which figures ran
+  earlier in the process; gating a figure off silently shifted later figures' error bars.
+  Each figure now seeds its own from `--boot-seed`.
+
 **THREE scripts now write into `figures/run3/paper/` and their outputs must not collide.**
 `make_paper_figures.py` owns the generic names (`captions.md`, `figure_manifest.json`);
 `make_ablation_figures.py` writes `captions_ablation.md` / `figure_manifest_ablation.json`;

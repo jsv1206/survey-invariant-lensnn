@@ -29,7 +29,8 @@ joint model is better at every survey -- so the confound works AGAINST the
 result reported here, which makes the conclusion stronger than the design alone
 could guarantee. The joint arm is ahead at 5/5 surveys.
 
-(b) **Deconvolution.** Top-octave complex error per survey, joint vs recon-only,
+(b) **Deconvolution.** High-freq. octave error per survey (defined at the end of
+this file), joint vs recon-only,
 with the `identity` and Wiener references. The metric is normalized so that
 emitting nothing scores exactly 1.0, and it is phase-aware -- a power ratio
 alone is gameable. This isolates what the theta_E objective costs (or buys)
@@ -69,3 +70,47 @@ unchanged. This ablation is self-contained at FOV 12" with the corrected reblur
 operator, so its arms are mutually comparable; its absolute numbers are not
 directly comparable to Run 2's, which is why all three arms were retrained here
 rather than reusing Run 2 as the joint arm.
+
+## Definitions -- training LOSS TERMS vs evaluation METRICS
+
+These are two different families and must not be conflated. The model is
+optimized on the loss terms; the figures report the metrics.
+
+**Training objective** (`losses.py`, weights from `lit_model.py`):
+
+| term | what it is | weight |
+|---|---|---|
+| L1 | `0.5*(masked + global)` mean abs. difference, both images divided by the `f_gt` peak. Half of it covers empty sky ON PURPOSE, as anti-hallucination pressure | 1.0 |
+| SSIM | `1 - ssim(f_hat, f_gt)`, peak-normalized | 0.5 |
+| FFT | L1 between the MAGNITUDE spectra, **all** frequencies -- phase-BLIND | 0.1 |
+| reblur | `\|f_hat*h - g\|^2 / mean(g^2)`, scale-free, needs no ground truth | 0.1 |
+| regression | MSE on theta_E | 1.0 |
+
+**Evaluation metrics** (what the figures plot):
+
+| name in figures | definition |
+|---|---|
+| theta_E frac. RMSE (%) | RMS of the per-lens `(pred-true)/true` |
+| L1 error (% of arc flux) | `sum\|f_hat - f_gt\| / sum(f_gt)` inside `f_gt > 1% of peak` |
+| **high-freq. octave error** | `sum\|F_hat - F_gt\|^2 / sum\|F_gt\|^2` over 0.5-1.0x the native Nyquist. Normalized so emitting nothing scores exactly **1.0**, a perfect reconstruction 0; above 1.0 is worse than emitting nothing |
+| reblur / floor | reblur residual over the floor an ORACLE reconstruction still leaves |
+
+**Two traps worth stating explicitly.**
+
+*The metrics are not the loss terms of the same name.* The L1 metric is masked and
+normalized by arc flux; the L1 loss term is half-weighted onto empty sky and
+normalized by peak. They are related, not equal.
+
+*The high-freq. octave error is NOT the FFT loss term.* The FFT term differences
+magnitude spectra over all frequencies and is therefore phase-BLIND; the metric
+differences COMPLEX coefficients in the top octave and is phase-AWARE. That
+distinction decides results: Run 1 scored a healthy-looking 0.86 top-octave power
+ratio at Euclid while its phase-aware error was 1.10 -- worse than emitting
+nothing, having put roughly the right amount of power in the wrong place. That
+published claim was retracted. A phase-blind score cannot adjudicate
+deconvolution.
+
+*"Native" Nyquist* means each survey's OWN grid: the band is identical in pixel
+units but spans 0.10-0.20" of structure at HST and 0.53-1.05" at DES. So a
+cross-survey comparison asks "did the network exploit the resolution it was
+given?", not "did DES recover what HST recovered".

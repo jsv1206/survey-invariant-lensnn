@@ -56,7 +56,7 @@ from .data import build_test_set_1, build_test_set_2
 #   Run 2's values and collided once Run 3's numbers moved the points).
 #   Run 2's figures in `figures/paper/` were produced with 1.0.0 and have NOT
 #   been regenerated -- that is deliberate; Run 2 is frozen.
-SCRIPT_VERSION = "1.2.1"
+SCRIPT_VERSION = "1.3.0"
 
 # --------------------------------------------------------------------------
 # Style. NeurIPS text width is 5.5in; half width 2.7in. Draw at final size --
@@ -121,13 +121,20 @@ def _mpl():
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     plt.rcParams.update({
-        "font.size": FS_BASE, "axes.titlesize": FS_BASE, "axes.labelsize": FS_SMALL,
-        "xtick.labelsize": FS_TINY, "ytick.labelsize": FS_TINY,
+        "font.size": FS_BASE, "axes.titlesize": FS_BASE, "axes.labelsize": FS_BASE,
+        "xtick.labelsize": FS_SMALL, "ytick.labelsize": FS_SMALL,
         "legend.fontsize": FS_TINY, "figure.titlesize": FS_BASE,
         "axes.edgecolor": INK_2, "axes.labelcolor": INK, "text.color": INK,
         "xtick.color": INK_2, "ytick.color": INK_2,
-        "axes.grid": True, "grid.color": GRID, "grid.linewidth": 0.5,
-        "axes.axisbelow": True, "axes.spines.top": False, "axes.spines.right": False,
+        "axes.grid": False, "grid.color": GRID, "grid.linewidth": 0.5,
+        # Closed box with ticks on all four sides, pointing INWARD, no grid --
+        # values are read off ticks, not gridlines. The top/right SPINES have to
+        # be re-enabled for this: ticks cannot be drawn on a hidden spine.
+        # Shared by make_ablation_figures.py and make_fig2_architecture.py, so
+        # this governs every figure in the paper set.
+        "xtick.direction": "in", "ytick.direction": "in",
+        "xtick.top": True, "ytick.right": True,
+        "axes.axisbelow": True, "axes.spines.top": True, "axes.spines.right": True,
         "lines.linewidth": 1.2, "figure.dpi": 200, "savefig.dpi": 200,
         "pdf.fonttype": 42, "ps.fonttype": 42,
     })
@@ -279,9 +286,11 @@ def per_sample_pass(model, items, device, batch_size=16, patch=4, noise_cfg=None
     bootstrap error bars need the individual lenses)."""
     out = {k: [] for k in ("theta_pred", "theta_true", "l1_norm_masked",
                            "ssim_norm", "hf_complex_err", "hf_coherence",
-                           "reblur_rel", "floor_rel",
+                           "reblur_rel", "floor_rel", "reblur_floor_op",
                            "l1_norm_masked_identity", "hf_complex_err_identity",
                            "l1_norm_masked_zeros", "hf_complex_err_zeros",
+                           "l1_rel_masked", "l1_rel_masked_identity",
+                           "l1_rel_masked_zeros",
                            "mask_frac")}
     prof = None
     n = len(items)
@@ -308,6 +317,19 @@ def per_sample_pass(model, items, device, batch_size=16, patch=4, noise_cfg=None
             den = mf.sum(dim=(1, 2, 3)).clamp_min(1.0)
             l1 = ((a - b).abs() * mf).sum(dim=(1, 2, 3)) / den
             out[f"l1_norm_masked{tag}"].extend(l1.cpu().tolist())
+            # RELATIVE L1: total absolute error over total arc flux, inside the
+            # same mask. Reported as a percentage because it reads directly as
+            # "off by X% of the arc's flux".
+            #
+            # Deliberately NOT a per-pixel |f_hat - f_gt| / f_gt: the mask floor
+            # is 1% of peak, so a pixel-wise ratio is amplified up to 100x at the
+            # mask edge and the metric ends up dominated by the faintest pixels.
+            # A ratio of SUMS is flux-weighted and robust. The peak
+            # normalization cancels in the ratio, so this is scale-free without
+            # relying on it.
+            num = ((a - b).abs() * mf).sum(dim=(1, 2, 3))
+            tot = (b * mf).sum(dim=(1, 2, 3)).clamp_min(1e-12)
+            out[f"l1_rel_masked{tag}"].extend((num / tot).cpu().tolist())
             if tag == "":
                 out["mask_frac"].extend(
                     (mf.sum(dim=(1, 2, 3)) / mf[0].numel()).cpu().tolist())
@@ -323,6 +345,15 @@ def per_sample_pass(model, items, device, batch_size=16, patch=4, noise_cfg=None
         gsq = (g ** 2).mean(dim=(1, 2, 3)).clamp_min(1e-12)
         rb = ((Lo.reblur(f_hat, h) - g) ** 2).mean(dim=(1, 2, 3)) / gsq
         out["reblur_rel"].extend(rb.cpu().tolist())
+        # OPERATOR floor: the residual an ORACLE reconstruction (f_hat = f_gt)
+        # still leaves, because `reblur` is not an exact inverse of the
+        # simulator's convolve-then-resample forward model. It is dominated by
+        # PSF-stamp aliasing (dataset bug 3) and spans ~211x across surveys,
+        # tracking sigma-in-pixels rather than survey quality. Raw reblur
+        # therefore confounds "how good is the reconstruction" with "how
+        # faithful is the diagnostic here" -- report the RATIO.
+        rb0 = ((Lo.reblur(f, h) - g) ** 2).mean(dim=(1, 2, 3)) / gsq
+        out["reblur_floor_op"].extend(rb0.cpu().tolist())
         if noise_cfg is not None:
             var = g.clamp_min(0.0) / noise_cfg["gain"] + noise_cfg["bkg_rms"] ** 2
             out["floor_rel"].extend((var.mean(dim=(1, 2, 3)) / gsq).cpu().tolist())
@@ -392,160 +423,361 @@ def _crop(img, s, half_arcsec=HERO_CROP_ARCSEC):
 # --------------------------------------------------------------------------
 def fig_hero(res, imgs, out_dir, manifest, slug="fig1_hero_grid",
              lens_ids=None, title=None):
-    """Rows = surveys ordered by pixel scale, cols = input / recon / truth /
-    residual. Every panel of a given row is divided by that row's f_gt peak,
-    so the four panels share vmin/vmax and the rows are comparable despite an
-    ~11x spread in raw per-pixel surface brightness across pixel scales."""
+    """COLUMNS = surveys ordered by pixel scale, ROWS = input / recon / truth /
+    residual.
+
+    Transposed from the original rows-are-surveys layout: five survey columns
+    across the text width is a landscape figure (~5.5 x 4.5in) instead of a
+    portrait one (~5.5 x 6.2in), which is the cheaper shape for a short paper.
+
+    Normalization is per SURVEY COLUMN, by that column's `f_gt` peak, so the
+    four panels of a column share vmin/vmax and columns stay comparable despite
+    a ~15x spread in raw per-pixel flux across pixel scales.
+
+    Multi-lens (figA1) stacks 4-row blocks vertically rather than widening to
+    15 columns, so the grid is always 5 wide.
+
+    Colorbars sit on the RIGHT here, not the bottom: after the transpose the two
+    colour scales are separated by ROW (magma for rows 0-2, diverging for the
+    residual row), so vertical bars align with what they describe. Both carry the
+    SAME dimensionless label with visibly different spans -- that is what makes
+    the residual's 20x tighter scale legible. They must NOT be labelled
+    "flux/px": the pixels are normalized and no longer carry that unit.
+
+    Units: `S` is flux per PIXEL in arbitrary simulator units -- there is no
+    zeropoint anywhere in sim_lens (src_amp ~ U(2,6)). It is not surface
+    brightness: lenstronomy returns flux per pixel and _area_resample SUMS to
+    conserve it, which is exactly why S_peak varies across surveys at all.
+    """
     plt = _mpl()
     lens_ids = lens_ids or [None]
     n_lens = len(imgs)
-    nrow = len(SURVEY_ORDER) * n_lens
-    fig, axes = plt.subplots(nrow, 4, figsize=(TEXT_W, 1.12 * nrow + 0.35),
-                             squeeze=False)
+    nrow = 4 * n_lens
+    ncol = len(SURVEY_ORDER)
+    fig = plt.figure(figsize=(TEXT_W, 0.97 * nrow + 0.72))
+    # 5 image columns + a narrow spacer + the colorbar column + a spacer for the
+    # bars' tick labels and rotated axis labels.
+    gs = fig.add_gridspec(nrow, ncol + 3,
+                          width_ratios=[1] * ncol + [0.12, 0.07, 0.42])
+    CBAR_COL = ncol + 1
+    axes = [[fig.add_subplot(gs[r, c]) for c in range(ncol)] for r in range(nrow)]
+    im_seq = im_div = None
     rows = []
-    cols = [r"input $g$", r"reconstruction $\hat f$", r"truth $f_{gt}$",
-            r"residual $\hat f - f_{gt}$"]
-    RESID_LIM = 0.30                      # +/- 30% of the truth's peak
+    row_names = [r"input $g$", r"recon $\hat f$", r"truth $f_{gt}$",
+                 r"resid $\hat f - f_{gt}$"]
+    RESID_LIM = 0.05          # see the note below the table in RESULTS_SUMMARY 4.4
+
     for li, per_survey in enumerate(imgs):
-        for si, nm in enumerate(SURVEY_ORDER):
+        for ci, nm in enumerate(SURVEY_ORDER):
             d = per_survey[nm]
-            row = li * len(SURVEY_ORDER) + si
             s = d["s"]
             pk = max(float(np.abs(d["f_gt"]).max()), 1e-12)
             panels = [d["g"] / pk, d["f_hat"] / pk, d["f_gt"] / pk,
                       (d["f_hat"] - d["f_gt"]) / pk]
             npix = d["f_gt"].shape[-1]
-            for ci, img in enumerate(panels):
-                ax = axes[row][ci]
+            for pi, img in enumerate(panels):
+                ax = axes[li * 4 + pi][ci]
                 c = _crop(img, s)
-                if ci == 3:
-                    ax.imshow(c, cmap=CMAP_RESID, vmin=-RESID_LIM, vmax=RESID_LIM,
-                              interpolation="nearest")
+                if pi == 3:
+                    h = ax.imshow(c, cmap=CMAP_RESID, vmin=-RESID_LIM,
+                                  vmax=RESID_LIM, interpolation="nearest")
+                    im_div = im_div or h
                 else:
-                    ax.imshow(c, cmap=CMAP_IMG, vmin=0.0, vmax=1.0,
-                              interpolation="nearest")
+                    h = ax.imshow(c, cmap=CMAP_IMG, vmin=0.0, vmax=1.0,
+                                  interpolation="nearest")
+                    im_seq = im_seq or h
                 ax.set_xticks([]); ax.set_yticks([]); ax.grid(False)
                 for sp in ax.spines.values():
                     sp.set_visible(False)
-                if row == 0:
-                    ax.set_title(cols[ci], fontsize=FS_TINY, pad=3)
-            # row label: the varying npix IS the result, so make it visible
-            axes[row][0].set_ylabel(
-                f"{nm}\n{s:.3f}\"/px\nFWHM {SV.SURVEYS[nm]['fwhm']:.2f}\"\n"
-                f"{npix}x{npix} px",
-                fontsize=FS_TINY, rotation=0, ha="right", va="center",
-                labelpad=18, color=SURVEY_COLORS[nm])
-            # 1" scale bar: physical size is constant while the pixel grid is not
-            ax = axes[row][0]
+                if ci == 0:
+                    ax.set_ylabel(row_names[pi], fontsize=FS_BASE, rotation=90,
+                                  ha="center", va="center", labelpad=6)
+            # column header: the varying npix IS the result, so keep it visible.
+            # S_peak is per (lens, survey), so it only belongs in a shared header
+            # when there is ONE lens; figA1 keeps it in the data CSV.
+            if li == 0:
+                head = (f"{nm}\n{s:.3f}\"/px\nFWHM {SV.SURVEYS[nm]['fwhm']:.2f}\"\n"
+                        f"{npix}x{npix} px")
+                if n_lens == 1:
+                    # `(f_gt)` is dropped here on purpose: the colorbar label
+                    # already spells out S / S_peak(f_gt), and repeating it in
+                    # five ~1in-wide headers crowds them for no information.
+                    head += f"\n$S_{{\\mathrm{{peak}}}}$ {pk:.3f} px$^{{-1}}$"
+                axes[0][ci].set_title(head, fontsize=FS_TINY, pad=3,
+                                      color=SURVEY_COLORS[nm])
+            # 1" scale bar on the input row: physical size is constant while the
+            # pixel grid is not
+            ax = axes[li * 4][ci]
             npx_crop = _crop(panels[0], s).shape[-1]
             bar_px = 1.0 / s
             ax.plot([0.06 * npx_crop, 0.06 * npx_crop + bar_px],
                     [0.92 * npx_crop, 0.92 * npx_crop],
-                    color="white", lw=1.6, solid_capstyle="butt")
-            ax.text(0.06 * npx_crop, 0.87 * npx_crop, "1\"", color="white",
-                    fontsize=FS_TINY, va="bottom")
+                    color="white", lw=1.4, solid_capstyle="butt")
+            ax.text(0.06 * npx_crop, 0.88 * npx_crop, "1\"", color="white",
+                    fontsize=FS_TINY - 1, va="bottom")
+            _rc = _crop(panels[3], s)
             rows.append(dict(lens_id=lens_ids[li], survey=nm, scale_arcsec_px=s,
                              fwhm_arcsec=SV.SURVEYS[nm]["fwhm"], npix_native=npix,
-                             theta_E_true=d["theta_E"],
-                             f_gt_peak=pk,
+                             theta_E_true=d["theta_E"], f_gt_peak=pk,
                              crop_half_arcsec=HERO_CROP_ARCSEC,
-                             resid_limit_frac_of_peak=RESID_LIM))
+                             resid_limit_frac_of_peak=RESID_LIM,
+                             resid_max_frac_of_peak=float(np.abs(_rc).max()),
+                             resid_rms_frac_of_peak=float(np.sqrt((_rc ** 2).mean())),
+                             resid_saturated_frac=float((np.abs(_rc) > RESID_LIM).mean())))
     if title:
         fig.suptitle(title, fontsize=FS_SMALL, y=1.0)
-    # a visible gap between adjacent image fills: without it the three dark
-    # panels of a row read as one wide band rather than three images
-    fig.tight_layout(h_pad=0.45, w_pad=0.9)
+    fig.tight_layout(h_pad=0.05, w_pad=0.30)
+
+    # Colorbars AFTER tight_layout, which does not lay out gridspec slices.
+    CBAR_LABEL = r"$S\,/\,S_{\mathrm{peak}}(f_{gt})$"
+    for rsl, handle, ticks in ((slice(0, 3), im_seq, [0.0, 0.5, 1.0]),
+                               (slice(3, 4), im_div,
+                                [-RESID_LIM, 0.0, RESID_LIM])):
+        if handle is None:
+            continue
+        cax = fig.add_subplot(gs[rsl, CBAR_COL])
+        pos = cax.get_position()
+        pad = 0.012
+        cax.set_position([pos.x0, pos.y0 + pad, pos.width, pos.height - 2 * pad])
+        cb = fig.colorbar(handle, cax=cax, ticks=ticks)
+        cb.set_label(CBAR_LABEL, fontsize=FS_TINY, labelpad=2)
+        cb.ax.tick_params(labelsize=FS_TINY, length=2, pad=1.5, direction="out")
+        cb.outline.set_linewidth(0.6)
     save_figure(fig, out_dir, slug, pd.DataFrame(rows), manifest)
 
 
 # --------------------------------------------------------------------------
 # Fig 3 -- quantitative survey invariance
 # --------------------------------------------------------------------------
-def fig_invariance(ts1, base1, out_dir, manifest, rng):
+def _frac_rmse(pred, true):
+    """RMS of the PER-LENS fractional error, (pred-true)/true.
+
+    Reported instead of absolute RMSE because a percentage is directly
+    interpretable against the truth, whereas "0.017 arcsec" needs the theta_E
+    range (0.5-2.5") to mean anything. Note this is a HARDER test of invariance,
+    not a rescaling: normalizing per lens up-weights small-theta_E systems where
+    a fixed positional error is a larger fraction, so the cross-survey spread
+    grows from 1.87x (absolute) to 2.75x (fractional).
+    """
+    pred, true = np.asarray(pred, float), np.asarray(true, float)
+    return float(np.sqrt(np.mean(((pred - true) / true) ** 2)))
+
+
+def fig_invariance(ts1, base1, out_dir, manifest, rng, ts2=None, base2=None,
+                   slug="fig3_survey_invariance"):
+    """Three stacked panels sharing ONE x axis (pixel scale).
+
+    Two panels: the regression head and the reconstruction head, both against
+    pixel scale. This keeps a clean split from Fig 4, which owns the
+    frequency-domain metric and the Wiener comparison -- no metric appears in
+    both figures.
+
+    A reblur/data-consistency panel was built and REMOVED. On noise-free data it
+    adds nothing independent (a good reconstruction implies good reblur
+    consistency), and it is confounded twice over: the reblur operator's own
+    floor spans ~100x across surveys for reasons unrelated to the network
+    (PSF-stamp aliasing, dataset bug 3), and because the reblur term is IN the
+    training loss the model partly compensates for that operator error where it
+    is largest -- at Roman 94.5% of lenses land BELOW the oracle floor, which
+    cannot be read as a better reconstruction. Reblur's value is on noisy/real
+    data; it belongs in Fig 5, not here.
+
+    Two reference lines were deliberately REMOVED and one deliberately KEPT:
+
+    * `prior_mean` (0.618") is gone from (a). It forced y-limits of 0.008..1.3,
+      a 162x span, leaving the data in the bottom ~1% of the axis where nothing
+      could be read. Zoomed to the data, the mild 1.87x trend with pixel scale
+      becomes visible -- which is why the prose must say "nearly flat", never
+      "flat". The number lives in RESULTS_SUMMARY.md for referees.
+    * `zeros` is gone from (b): 2-12x worse than `identity`, so beating
+      `identity` implies it.
+    * `identity` STAYS in (b) and is load-bearing. Trained L1 rises 22x across
+      the pixel-scale range, which alone reads as the method degrading;
+      `identity` rises 13x over the same range, so the correct reading is that
+      the PROBLEM got harder while the margin held at 4.7-7.8x. Masked L1 is
+      also low-frequency dominated, where `g` is already close to `f_gt` -- so
+      without this line a reader cannot tell deconvolution from pass-through.
+    """
     plt = _mpl()
-    fig, axes = plt.subplots(1, 3, figsize=(TEXT_W, 2.15))
+    fig, axes = plt.subplots(1, 3, figsize=(TEXT_W, 2.25))
+    LBL, TCK = FS_SMALL, FS_TINY
+    # Two variants from one function, like fig_hero does for fig1/figA1:
+    #   ts2 = None -> Test Set 1 only         (Representations; no noise discussion)
+    #   ts2 given  -> both test sets overlaid (Sim2Science; the noise shift IS the point)
+    # Filled marker = noise-free, OPEN marker = with noise. Chosen over alpha
+    # because it survives greyscale and stays legible at ms=4.
+    # Same marker SIZE for both sets -- only the fill differs (solid = noise-free,
+    # hollow = with noise). Separation comes from the x-nudge below, not from
+    # size, so neither series is visually weighted above the other.
+    #
+    # The 4th element is that x-nudge, so the two error bars do not overprint.
+    # It is applied MULTIPLICATIVELY in (a)/(b), whose x axis is log, and
+    # ADDITIVELY in (c), whose x axis is linear -- a single offset value would
+    # be wrong in one of them. The nudge is presentational: both members of a
+    # pair share the same TRUE x, and the caption says so.
+    XLOG, XLIN = 1.055, 0.045
+    SETS = [(ts1, 1, dict(ms=4), 0)]
+    if ts2 is not None:
+        # Open marker for the noisy set, drawn LARGER with a THINNER edge: at
+        # ms=4 with edgewidth 1.1 the ring is nearly all edge and reads as
+        # filled. A hollow centre needs room to be seen.
+        SETS.append((ts2, 2, dict(ms=4, markerfacecolor="none",
+                                  markeredgewidth=0.9), 1))
     rows = []
-    prior_rmse = float(np.mean([base1[nm]["prior_mean"]["theta_rmse"]
-                                for nm in SURVEY_ORDER]))
-
-    # (a) predicted vs true
-    ax = axes[0]
-    lo, hi = 0.35, 2.65
-    ax.fill_between([lo, hi], [lo - prior_rmse, hi - prior_rmse],
-                    [lo + prior_rmse, hi + prior_rmse],
-                    color=INK_MUTED, alpha=0.13, lw=0, zorder=0)
-    ax.plot([lo, hi], [lo, hi], ls="--", lw=0.9, color=INK_2, zorder=1)
-    for nm in SURVEY_ORDER:
-        r = ts1[nm]
-        ax.scatter(r["theta_true"], r["theta_pred"], s=4, alpha=0.55, lw=0,
-                   marker=SURVEY_MARKERS[nm], color=SURVEY_COLORS[nm],
-                   label=f"{nm} {_rmse(r['theta_pred'], r['theta_true']):.3f}\"",
-                   zorder=3)
-    ax.set_xlabel(r"true $\theta_E$ (arcsec)")
-    ax.set_ylabel(r"predicted $\theta_E$ (arcsec)")
-    ax.set_title("(a) one network, 5 surveys", fontsize=FS_SMALL)
-    ax.set_xlim(lo, hi); ax.set_ylim(lo, hi); ax.set_aspect("equal")
-    ax.legend(title="RMSE", loc="upper left", frameon=False, handletextpad=0.2,
-              borderpad=0.1, labelspacing=0.18, title_fontsize=FS_TINY)
-    ax.text(0.97, 0.06, "shaded: prior-mean\nRMSE band", transform=ax.transAxes,
-            ha="right", va="bottom", fontsize=FS_TINY, color=INK_MUTED)
-
-    # (b) theta RMSE vs pixel scale
-    ax = axes[1]
-    for nm in SURVEY_ORDER:
-        r = ts1[nm]
-        pt, blo, bhi = boot_ci_paired(r["theta_pred"], r["theta_true"], _rmse, rng)
-        s = SV.SURVEYS[nm]["scale"]
-        ax.errorbar(s, pt, yerr=[[pt - blo], [bhi - pt]], fmt=SURVEY_MARKERS[nm],
-                    ms=4, color=SURVEY_COLORS[nm], capsize=2, lw=1.0, zorder=3)
-        dy = 7 if nm not in ("Roman", "DES") else -13
-        ax.annotate(nm, (s, pt), textcoords="offset points", xytext=(0, dy),
-                    ha="center", fontsize=FS_TINY, color=SURVEY_COLORS[nm])
-        rows.append(dict(panel="b", survey=nm, scale_arcsec_px=s,
-                         theta_rmse=pt, ci_lo=blo, ci_hi=bhi,
-                         prior_mean_rmse=base1[nm]["prior_mean"]["theta_rmse"]))
-    ax.axhline(prior_rmse, ls="--", lw=1.0, color=INK_MUTED, zorder=1)
-    ax.text(0.055, prior_rmse * 0.90, f"prior-mean baseline ({prior_rmse:.2f}\")",
-            fontsize=FS_TINY, color=INK_MUTED, va="top")
-    ax.set_xscale("log"); ax.set_yscale("log")
-    ax.set_xlabel("pixel scale (arcsec/px)")
-    ax.set_ylabel(r"$\theta_E$ RMSE (arcsec)")
-    ax.set_title(r"(b) $\theta_E$ vs pixel scale", fontsize=FS_SMALL)
-    ax.set_ylim(0.008, 1.3)
-
-    # (c) masked normalized recon L1 vs pixel scale, with the null models
-    ax = axes[2]
-    for nm in SURVEY_ORDER:
-        r = ts1[nm]
-        s = SV.SURVEYS[nm]["scale"]
-        pt, blo, bhi = boot_ci(r["l1_norm_masked"], np.mean, rng)
-        ax.errorbar(s, pt, yerr=[[pt - blo], [bhi - pt]], fmt=SURVEY_MARKERS[nm],
-                    ms=4, color=SURVEY_COLORS[nm], capsize=2, lw=1.0, zorder=3)
-        rows.append(dict(panel="c", survey=nm, scale_arcsec_px=s,
-                         l1_norm_masked=pt, ci_lo=blo, ci_hi=bhi,
-                         identity=float(np.mean(r["l1_norm_masked_identity"])),
-                         zeros=float(np.mean(r["l1_norm_masked_zeros"]))))
     xs = [SV.SURVEYS[n]["scale"] for n in SURVEY_ORDER]
-    for key, lab, ls in (("l1_norm_masked_identity", "identity ($\\hat f = g$)", "--"),
-                         ("l1_norm_masked_zeros", "zeros ($\\hat f = 0$)", ":")):
-        ax.plot(xs, [float(np.mean(ts1[n][key])) for n in SURVEY_ORDER],
-                ls=ls, lw=1.0, color=INK_MUTED, marker="", zorder=1, label=lab)
-    ax.set_xscale("log"); ax.set_yscale("log")
-    ax.set_xlabel("pixel scale (arcsec/px)")
-    ax.set_ylabel("masked normalized L1")
-    ax.set_title("(c) recon vs pixel scale", fontsize=FS_SMALL)
-    ax.legend(loc="lower right", frameon=False, handletextpad=0.4,
-              borderpad=0.1, labelspacing=0.2)
-    _no_minor_labels(axes[1], axes[2])
 
-    for nm in SURVEY_ORDER:
-        r = ts1[nm]
-        pt, blo, bhi = boot_ci_paired(r["theta_pred"], r["theta_true"], _rmse, rng)
-        rows.append(dict(panel="a", survey=nm, scale_arcsec_px=SV.SURVEYS[nm]["scale"],
-                         theta_rmse=pt, ci_lo=blo, ci_hi=bhi,
-                         prior_mean_rmse=base1[nm]["prior_mean"]["theta_rmse"]))
-    fig.tight_layout(w_pad=2.2)
-    save_figure(fig, out_dir, "fig3_survey_invariance", pd.DataFrame(rows), manifest)
+    # ---- (a) theta_E RMSE -------------------------------------------------
+    ax = axes[0]
+    pts = []
+    for src, tset, style, sh in SETS:
+        for nm in SURVEY_ORDER:
+            r = src[nm]
+            pt, blo, bhi = boot_ci_paired(r["theta_pred"], r["theta_true"],
+                                          lambda a, b: 100.0 * _frac_rmse(a, b), rng)
+            s_ = SV.SURVEYS[nm]["scale"]
+            xp = s_ * (XLOG ** sh)
+            ax.errorbar(xp, pt, yerr=[[pt - blo], [bhi - pt]],
+                        fmt=SURVEY_MARKERS[nm], color=SURVEY_COLORS[nm],
+                        capsize=2, lw=1.0, zorder=3, **style)
+            if tset == 1:
+                pts.append((s_, pt, nm))
+            _t = np.asarray(r["theta_true"], float)
+            _e = np.asarray(r["theta_pred"], float) - _t
+            rows.append(dict(panel="a", survey=nm, test_set=tset, scale_arcsec_px=s_,
+                             theta_frac_rmse_pct=pt, ci_lo=blo, ci_hi=bhi,
+                             theta_rmse_arcsec=_rmse(r["theta_pred"], r["theta_true"]),
+                             theta_frac_median_pct=float(100 * np.median(np.abs(_e / _t))),
+                             prior_mean_rmse=base1[nm]["prior_mean"]["theta_rmse"]))
+    # Survey names appear ONCE, as a legend on the top panel -- every panel
+    # plots the same five x positions with the same colour/marker, so one key
+    # serves all three. Point annotations were tried and do not fit: Euclid
+    # (0.100) and Roman (0.110) sit 10% apart in x at different heights, so
+    # even alternating offsets overprint in a 3.6in-wide panel.
+    from matplotlib.lines import Line2D
+    survey_handles = [Line2D([], [], marker=SURVEY_MARKERS[n], ls="",
+                             color=SURVEY_COLORS[n], ms=3.0, label=n)
+                      for n in SURVEY_ORDER]
+    # LINEAR, not log: the data spans 1.87x, which contains no decade tick, so
+    # a log axis renders with no y labels at all. Linear also shows the mild
+    # trend honestly instead of flattening it.
+    ax.set_ylim(0, max(r["theta_frac_rmse_pct"] for r in rows
+                       if r["panel"] == "a") * 1.30)
+    ax.set_ylabel(r"$\theta_E$ frac. RMSE (%)", fontsize=LBL)
+    ax.set_xscale("log")
+    ax.set_xlabel("pixel scale (arcsec/px)", fontsize=LBL)
+    ax.set_title("(a) Einstein radius", fontsize=FS_SMALL, pad=3)
+
+    # ---- (b) masked normalized L1, with the identity reference ------------
+    ax = axes[1]
+    for src, tset, style, sh in SETS:
+        for nm in SURVEY_ORDER:
+            r = src[nm]
+            s_ = SV.SURVEYS[nm]["scale"]
+            pt, blo, bhi = boot_ci(100.0 * np.asarray(r["l1_rel_masked"]),
+                                   np.mean, rng)
+            xp = s_ * (XLOG ** sh)
+            ax.errorbar(xp, pt, yerr=[[pt - blo], [bhi - pt]],
+                        fmt=SURVEY_MARKERS[nm], color=SURVEY_COLORS[nm],
+                        capsize=2, lw=1.0, zorder=3, **style)
+            rows.append(dict(panel="b", survey=nm, test_set=tset, scale_arcsec_px=s_,
+                             l1_rel_pct=pt, ci_lo=blo, ci_hi=bhi,
+                             identity_pct=float(100 * np.mean(r["l1_rel_masked_identity"])),
+                             l1_norm_masked=float(np.mean(r["l1_norm_masked"]))))
+    ax.plot(xs, [100 * float(np.mean(ts1[n]["l1_rel_masked_identity"]))
+                 for n in SURVEY_ORDER],
+            ls="--", lw=1.0, color=INK_MUTED, marker="", zorder=1,
+            label=r"identity ($\hat f = g$)")
+    ax.set_yscale("log")
+    ax.set_xscale("log")
+    ax.set_xlabel("pixel scale (arcsec/px)", fontsize=LBL)
+    ax.set_ylabel("L1 error (% of arc flux)", fontsize=LBL)
+    ax.set_title("(b) reconstruction", fontsize=FS_SMALL, pad=3)
+    ax.legend(loc="lower right", frameon=False, handletextpad=0.5,
+              borderpad=0.1, labelspacing=0.2, fontsize=FS_TINY)
+
+    # ---- (c) top-octave error vs PSF sampling -----------------------------
+    # Moved here from Fig 4. Kept DIMENSIONLESS on purpose while (a) and (b) are
+    # percentages: hf_complex_err divides squared amplitudes, so x100 would be a
+    # % of POWER sitting beside two % of FLUX. HST reads 1.68% in power but 13.0%
+    # in amplitude -- an order-of-magnitude misreading that adjacency alone would
+    # invite. The documented "1.0 == emitting nothing" convention is clearer.
+    #
+    # x is PSF sigma in native pixels, NOT pixel scale like (a)/(b): measured
+    # Spearman rho = +0.90 (p=0.037) against sigma_px versus +0.60 (p=0.285),
+    # not significant, against pixel scale. A one-row layout shares no axis, so
+    # the mixed x costs nothing structurally and keeps the panel explanatory.
+    ax = axes[2]
+    xs_s, ident_c, wien_c, pts_c = [], [], [], []
+    for src, tset, style, sh in SETS:
+        for nm in SURVEY_ORDER:
+            r = src[nm]
+            x_ = _sigma_px(nm)
+            xp = x_ + XLIN * sh
+            pt, blo, bhi = boot_ci(r["hf_complex_err"], np.mean, rng)
+            ax.errorbar(xp, pt, yerr=[[pt - blo], [bhi - pt]],
+                        fmt=SURVEY_MARKERS[nm], color=SURVEY_COLORS[nm],
+                        capsize=2, lw=1.0, zorder=3, **style)
+            pts_c.append(pt)
+            if tset == 1:
+                xs_s.append(x_)
+                ident_c.append(float(np.mean(r["hf_complex_err_identity"])))
+                wien_c.append(float(base1[nm]["wiener_hf"]["hf_complex_err"]))
+            rows.append(dict(panel="c", survey=nm, test_set=tset, sigma_px=x_,
+                             hf_complex_err=pt, ci_lo=blo, ci_hi=bhi,
+                             hf_coherence=float(np.mean(r["hf_coherence"]))))
+    for nm, i_, w_ in zip(SURVEY_ORDER, ident_c, wien_c):
+        rows.append(dict(panel="c_ref", survey=nm, test_set=1,
+                         sigma_px=_sigma_px(nm), identity=i_, wiener=w_))
+    o = np.argsort(xs_s)
+    xa = np.array(xs_s)[o]
+    ax.plot(xa, np.array(ident_c)[o], ls="--", lw=1.0, color=INK_MUTED,
+            marker="", zorder=1, label="identity")
+    ax.plot(xa, np.array(wien_c)[o], ls=":", lw=1.0, color=INK_2, marker="",
+            zorder=1, label="Wiener")
+    # Wiener under NOISE. Without this the noise variant would show only the
+    # noise-free reference, and "the network beats an oracle-tuned Wiener
+    # 4.0-8.7x once its noise assumption breaks" -- the strongest quantitative
+    # claim in the sim-to-real story -- would appear in no figure at all.
+    # Wiener's K is re-swept per test set: its noise-free optimum is up to 13
+    # decades from its noisy one, so carrying one K across both would fake a
+    # collapse.
+    if ts2 is not None and base2 is not None:
+        w2 = [float(base2[nm]["wiener_hf"]["hf_complex_err"]) for nm in SURVEY_ORDER]
+        xa2 = np.array([_sigma_px(nm) + XLIN for nm in SURVEY_ORDER])[o]
+        ax.plot(xa2, np.array(w2)[o], ls=":", lw=1.0, color=INK_2, marker="",
+                alpha=0.5, zorder=1, label="Wiener (noise)")
+        for nm, v in zip(SURVEY_ORDER, w2):
+            rows.append(dict(panel="c_ref", survey=nm, test_set=2,
+                             sigma_px=_sigma_px(nm), wiener=v))
+    ax.axhline(1.0, ls="-", lw=0.8, color=INK_2, zorder=1)
+    ax.set_yscale("log")
+    ax.set_xlabel(r"PSF $\sigma$ (native px)", fontsize=LBL)
+    ax.set_ylabel("high-freq. octave error", fontsize=LBL)
+    ax.set_title("(c) deconvolution", fontsize=FS_SMALL, pad=3)
+    ax.set_xlim(min(xs_s) - 0.18, max(xs_s) + 0.18)
+    # Do NOT clip the top: HST's Test Set 2 point sits ABOVE 1.0 (worse than
+    # emitting nothing) and that failure has to stay visible.
+    ax.set_ylim(min(pts_c) * 0.35, max(2.4, max(pts_c) * 1.9))
+    ax.legend(loc="lower right", frameon=False, fontsize=FS_TINY,
+              handletextpad=0.5, borderpad=0.1, labelspacing=0.2)
+
+    for a in axes:
+        a.tick_params(labelsize=TCK)
+    _no_minor_labels(*axes)
+    # `rect` reserves the strip the figure-level legend sits in; tight_layout
+    # does not know about it otherwise.
+    fig.tight_layout(w_pad=1.1, rect=(0, 0.085, 1, 1))
+    handles = list(survey_handles)
+    if ts2 is not None:
+        handles += [Line2D([], [], marker="o", ls="", color=INK_2, ms=3.0,
+                           label="noise-free"),
+                    Line2D([], [], marker="o", ls="", color=INK_2, ms=3.0,
+                           markerfacecolor="none", markeredgewidth=0.9,
+                           label="survey noise")]
+    fig.legend(handles=handles, loc="lower center", ncol=len(handles),
+               frameon=False, fontsize=FS_TINY, bbox_to_anchor=(0.5, 0.0),
+               handletextpad=0.25, columnspacing=0.75, borderpad=0.1)
+    save_figure(fig, out_dir, slug, pd.DataFrame(rows), manifest)
 
 
 # --------------------------------------------------------------------------
@@ -597,57 +829,7 @@ def fig_deconvolution(ts1, base1, imgs_hero, out_dir, manifest, rng,
                          P_truth=P_gt[k], P_input=P_g[k], P_recon=P_hat[k],
                          psf_cutoff_u=u_cut))
 
-    # (b) top-octave complex error vs PSF width in NATIVE pixels
-    ax = fig.add_subplot(gs[0, 2:])
-    ax.axhline(1.0, color=INK_2, ls="-", lw=0.9, zorder=1)
-    ax.text(0.02, 1.03, "worse than emitting nothing", transform=ax.get_yaxis_transform(),
-            fontsize=FS_TINY, color=INK_2, va="bottom")
-    xs, ident, wien, ylo, yhi, label_pts = [], [], [], [], [], []
-    for nm in SURVEY_ORDER:
-        r = ts1[nm]
-        x = _sigma_px(nm)
-        pt, blo, bhi = boot_ci(r["hf_complex_err"], np.mean, rng)
-        ax.errorbar(x, pt, yerr=[[pt - blo], [bhi - pt]], fmt=SURVEY_MARKERS[nm],
-                    ms=4.5, color=SURVEY_COLORS[nm], capsize=2, lw=1.0, zorder=4)
-        label_pts.append((x, pt, nm))
-        xs.append(x); ylo.append(blo); yhi.append(bhi)
-        ident.append(float(np.mean(r["hf_complex_err_identity"])))
-        wien.append(float(base1[nm]["wiener_hf"]["hf_complex_err"]))
-        rows.append(dict(panel="b", survey=nm, sigma_px=x,
-                         hf_complex_err=pt, ci_lo=blo, ci_hi=bhi,
-                         identity=ident[-1], wiener=wien[-1],
-                         wiener_K=base1[nm]["wiener_hf"]["wiener_K"],
-                         wiener_K_at_grid_edge=base1[nm]["wiener_hf"]["wiener_K_at_grid_edge"],
-                         hf_coherence=float(np.mean(r["hf_coherence"]))))
-    o = np.argsort(xs)
-    xs_a = np.array(xs)[o]
-    ax.plot(xs_a, np.array(ident)[o], ls="--", lw=1.0, color=INK_MUTED,
-            label="identity (no deconvolution)")
-    ax.plot(xs_a, np.array(wien)[o], ls=":", lw=1.0, color=INK_2,
-            label="Wiener (known PSF, best $K$)")
-    ax.set_yscale("log")
-    ax.set_xlabel(r"PSF $\sigma$ in native pixels")
-    ax.set_ylabel("top-octave complex error")
-    # Labels always go ABOVE their point, alternating between two heights in
-    # x-order. Two rules, both load-bearing: alternating heights keeps
-    # neighbours in x from colliding (Rubin and DES sit 0.04 px apart in PSF
-    # sigma), and keeping every label above leaves the band beneath the lowest
-    # datum clear for the legend, which no series can wander into.
-    for rank, (px, py, nm) in enumerate(sorted(label_pts)):
-        dy = 8 if rank % 2 == 0 else 20
-        ax.annotate(nm, (px, py), textcoords="offset points", xytext=(0, dy),
-                    ha="center", va="bottom",
-                    fontsize=FS_TINY, color=SURVEY_COLORS[nm])
-    ax.set_xlim(min(xs) - 0.22, max(xs) + 0.26)
-    # open a clear band under the lowest datum so the legend has somewhere to
-    # sit that no series can wander into
-    ax.set_ylim(min(ylo + wien) * 0.16, max(yhi + ident + [1.0]) * 1.9)
-    ax.set_title("(b) deconvolution vs PSF sampling", fontsize=FS_SMALL)
-    ax.legend(loc="lower left", frameon=False, handletextpad=0.4, borderpad=0.1,
-              labelspacing=0.2)
-    _no_minor_labels(ax)
-
-    # (c) reblur residual per survey -- the diagnostic that needs no truth
+    # (b) reblur residual per survey -- the diagnostic that needs no truth
     lim = 0.0
     for nm in SURVEY_ORDER:
         d = imgs_hero[nm]
@@ -671,7 +853,7 @@ def fig_deconvolution(ts1, base1, imgs_hero, out_dir, manifest, rng,
                          reblur_resid_rms_frac_of_peak=float(np.sqrt(np.mean(c ** 2))),
                          colour_limit_frac_of_peak=lim))
     _row_label(fig, row_axes,
-               f"(c) reblur residual $\\hat f * h - g$, no ground truth needed "
+               f"(b) reblur residual $\\hat f * h - g$, no ground truth needed "
                f"($\\pm${lim * 100:.0f}% of peak $g$)")
     save_figure(fig, out_dir, "fig4_deconvolution", pd.DataFrame(rows), manifest)
 
@@ -787,7 +969,7 @@ def fig_noise_shift(ts1, ts2, base1, base2, imgs_ts2, out_dir, manifest, rng):
     ax.text(len(x) - 0.55, 1.03, "worse than emitting nothing", fontsize=FS_TINY,
             color=INK_2, ha="right", va="bottom")
     ax.set_xticks(x); ax.set_xticklabels(SURVEY_ORDER)
-    ax.set_ylabel("top-octave complex error")
+    ax.set_ylabel("high-freq. octave error")
     # headroom above HST's TS2 bar (1.03) for the Wiener legend; the TS1/TS2
     # colour key is already in panel (a), so this legend carries only the tick.
     ax.set_ylim(0, 1.78)
@@ -878,6 +1060,77 @@ def _git_state():
                 working_tree="dirty" if dirty and dirty != "unknown" else "clean")
 
 
+FIG5_SECTION = """## Fig 5 -- Sim-to-real: a noise-free simulator meeting noisy data
+
+The model is trained on **noise-free** simulations and evaluated here, with no
+retraining and no noise augmentation, on the same lenses rendered with each
+survey's own noise. (a) theta_E RMSE degrades by the annotated factor but stays
+far below the prior-mean null at every survey. (b) The reblur residual divided
+by its own analytic noise floor. **This panel is known to be wrong at Roman:**
+the analytic floor omits the reblur operator's own error, which is 38% of
+Roman's true floor, so the panel reports 1.87 where the correct value against
+`reblur_floor_op` is 0.65 -- below 1.0, i.e. fitting noise. The other four
+surveys move by <=6%. (c) Reblur residual maps on noisy input -- the diagnostic
+that needs no ground truth. (d) High-freq. octave error before and after the
+noise shift, with a black tick per bar marking Wiener at its best `K`, re-swept
+separately on each test set. {wiener_note} {fail_note}"""
+
+FIG5_OMITTED = """## Fig 5 -- NOT EMITTED
+
+`fig_noise_shift` is retained in the code and can be re-enabled with `--with-fig5`,
+but is not part of either paper. Its theta_E and top-octave panels are duplicated by
+`fig3_survey_invariance_noise`, which shows the same TS1-vs-TS2 comparison across
+three metrics. Its reblur/noise-floor panel was additionally **wrong**: it divided by
+an ANALYTIC noise-variance estimate that omits the reblur operator's own error. At
+Roman that operator error is 38% of the true floor, so the panel reported 1.87 where
+the correct value is 0.65 -- below 1.0, which by that panel's own legend means the
+model is fitting noise. It ranked Roman healthiest when Roman is the opposite. The
+other four surveys moved by <=6%.
+
+**What must move into the TEXT, since no figure now shows it:**
+
+* **The reblur consistency diagnostic itself.** With Fig 4 also dropped, no figure
+  shows the reblur residual. This is the mechanism the sim-to-real claim rests on, so
+  state it numerically: on noisy input the diagnostic flags HST at **0.92x its own
+  analytic noise floor** -- below 1.0, i.e. fitting noise -- **without using ground
+  truth**, which is exactly the property that transfers to real data.
+* **The reblur floor caveat**, if the number above is quoted: the analytic floor omits
+  the operator error, so Roman's ratio in particular should be computed against
+  `reblur_floor_op` (the residual an ORACLE reconstruction leaves) rather than against
+  `floor_rel`.
+"""
+
+FIG4_SECTION = """## Fig 4 -- The network is deconvolving, not smoothing
+
+(a) Azimuthally averaged power spectra at {profile_survey}: the input has lost
+power through the top octave (shaded, 0.5-1.0x native Nyquist) and the
+reconstruction puts it back. (b) The reblur residual `f_hat * h - g` for one
+lens per survey: small and structureless is good, and because it needs no
+ground truth it is the one diagnostic that transfers unchanged to real data."""
+
+FIG4_OMITTED = """## Fig 4 -- NOT EMITTED
+
+`fig_deconvolution` is retained in the code and can be re-enabled with
+`--with-fig4`, but is not part of either paper. Its top-octave panel moved into
+Fig 3(c), where the same metric is reported for all five surveys against
+`identity` and Wiener. Its remaining two panels were judged redundant for a
+5-page paper: the reblur residual maps repeat Fig 5(c), which shows the same
+diagnostic on NOISY data (the case that matters), and the power spectra
+illustrate at one survey what Fig 3(c) measures quantitatively at all five.
+
+Two things that panel carried should be stated in the TEXT instead, since no
+figure now shows them:
+
+* **Top-octave coherence** -- the direct answer to "is this just sharpening
+  artifacts?". Recovered high-frequency structure is phase-aligned with the
+  truth, and most dramatically where the blur is worst: trained vs `identity`
+  is 0.993/0.900 at HST, 0.975/0.615 at Rubin, 0.958/0.587 at DES. A sharpening
+  artifact would raise power without raising coherence.
+* **`hf_harm_frac_*`** -- the fraction of top-octave power sitting on the patch
+  decoder's own grid harmonic, which for patch=4 lands exactly on the band edge.
+
+"""
+
 CAPTIONS = """# Figure captions
 
 Auto-generated by `survey_lens/make_paper_figures.py` v{version}.
@@ -914,49 +1167,90 @@ cross-attention before two heads emit the deconvolved image and theta_E.
 
 ## Fig 3 -- Survey invariance is quantitative, not anecdotal
 
-(a) Predicted vs true Einstein radius for all five surveys on the **same**
-paired lens population; the shaded band is the prior-mean null model's RMSE.
-(b) theta_E RMSE against pixel scale on log axes: {rmse_lo:.3f}-{rmse_hi:.3f}
-arcsec across a 5.3x range of pixel scale, {factor:.0f}-{factor_hi:.0f}x below
-the prior-mean baseline of {prior:.3f} arcsec. (c) Masked normalized L1
-against pixel scale, with the `identity` (no deconvolution) and `zeros` null
-models as reference lines. Error bars are the 16-84th percentile over 1000
-bootstrap resamples of the {n_lens} test lenses.
+All five surveys share the **same** paired lens population, so a cross-survey
+gap is the telescope and not a different lens sample.
 
-## Fig 4 -- The network is deconvolving, not smoothing
+(a) Einstein-radius error as a percentage of the true theta_E. Nearly flat --
+not flat: it degrades mildly and monotonically toward coarser pixels. Note the
+per-lens normalization makes this a HARDER test than absolute RMSE, since it
+up-weights small-theta_E systems where a fixed positional error is a larger
+fraction.
 
-(a) Azimuthally averaged power spectra at {profile_survey}: the input has lost
-power through the top octave (shaded, 0.5-1.0x native Nyquist) and the
-reconstruction puts it back. (b) Top-octave **complex** error -- phase-aware,
-and normalized so that emitting nothing scores exactly 1.0 -- against PSF
-sigma in native pixels, with the `identity` baseline and classical Wiener
-deconvolution with the *known* PSF. Wiener's regularization `K` is swept and
-chosen **on this same top-octave metric**, on the evaluation set itself -- so
-the classical baseline is shown at its best on exactly the number it is being
-judged by, which makes this a deliberately generous upper bound on it. (An
-earlier version selected `K` by masked L1 and then scored it here, which
-understated Wiener.) Caveat that belongs with this panel: the network learned
-the simulator's exact generative distribution, so beating a generic-prior
-filter on data drawn from that prior is easier than it would be on real sky --
-Wiener's weaker assumptions transfer more honestly. (c) The reblur residual `f_hat * h - g` for one
-lens per survey: small and structureless is good, and because it needs no
-ground truth it is the one diagnostic that transfers unchanged to real data.
+(b) Relative L1 **metric** on the reconstruction, sum|f_hat - f_gt| / sum(f_gt)
+over pixels with `f_gt > 1% of peak`, with `identity` (return the blurred input
+unchanged) as the reference. This is NOT the L1 term of the training objective,
+which is half-weighted onto empty sky as anti-hallucination pressure and is
+accompanied by SSIM and FFT terms. {ssim_note}
 
-## Fig 5 -- Sim-to-real: a noise-free simulator meeting noisy data
+(c) High-freq. octave error against PSF sigma in NATIVE pixels -- the
+honest difficulty axis for deconvolution, and a different x from (a)/(b) on
+purpose: the effect tracks PSF sampling, not pixel scale. Left DIMENSIONLESS
+while (a) and (b) are percentages because it divides squared amplitudes, so a
+percentage here would be a fraction of POWER sitting beside two fractions of
+FLUX. `identity` and Wiener-with-known-PSF are shown for reference.
 
-The model is trained on **noise-free** simulations and evaluated here, with no
-retraining and no noise augmentation, on the same lenses rendered with each
-survey's own noise. (a) theta_E RMSE degrades by the annotated factor but
-stays far below the prior-mean null at every survey. (b) The reblur residual
-divided by its own analytic noise floor `mean(max(g,0)/gain + bkg_rms^2)`,
-both in the scale-free units of the reblur loss: 1.0 is the best any
-reconstruction can do on noisy input, and *below* 1.0 would mean the model is
-fitting noise. (c) Reblur residual maps on noisy input. (d) Top-octave complex
-error before and after the noise shift. The black tick on each bar is Wiener
-deconvolution with the *known* PSF at its best `K`, re-swept **separately on
-each test set** -- Wiener's noise-free optimum sits up to 13 decades away from
-its noisy one, so carrying one `K` across both would understate the baseline.
-{wiener_note} **{fail_note}**
+## Definitions -- training LOSS TERMS vs evaluation METRICS
+
+These are two different families and must not be conflated. The model is
+optimized on the loss terms; the figures report the metrics.
+
+**Training objective** (`losses.py`, weights from `lit_model.py`):
+
+| term | what it is | weight |
+|---|---|---|
+| L1 | `0.5*(masked + global)` mean abs. difference, both images divided by the `f_gt` peak. Half of it covers empty sky ON PURPOSE, as anti-hallucination pressure | 1.0 |
+| SSIM | `1 - ssim(f_hat, f_gt)`, peak-normalized | 0.5 |
+| FFT | L1 between the MAGNITUDE spectra, **all** frequencies -- phase-BLIND | 0.1 |
+| reblur | `\|f_hat*h - g\|^2 / mean(g^2)`, scale-free, needs no ground truth | 0.1 |
+| regression | MSE on theta_E | 1.0 |
+
+**Evaluation metrics** (what the figures plot):
+
+| name in figures | definition |
+|---|---|
+| theta_E frac. RMSE (%) | RMS of the per-lens `(pred-true)/true` |
+| L1 error (% of arc flux) | `sum\|f_hat - f_gt\| / sum(f_gt)` inside `f_gt > 1% of peak` |
+| **high-freq. octave error** | `sum\|F_hat - F_gt\|^2 / sum\|F_gt\|^2` over 0.5-1.0x the native Nyquist. Normalized so emitting nothing scores exactly **1.0**, a perfect reconstruction 0; above 1.0 is worse than emitting nothing |
+| reblur / floor | reblur residual over the floor an ORACLE reconstruction still leaves |
+
+**Two traps worth stating explicitly.**
+
+*The metrics are not the loss terms of the same name.* The L1 metric is masked and
+normalized by arc flux; the L1 loss term is half-weighted onto empty sky and
+normalized by peak. They are related, not equal.
+
+*The high-freq. octave error is NOT the FFT loss term.* The FFT term differences
+magnitude spectra over all frequencies and is therefore phase-BLIND; the metric
+differences COMPLEX coefficients in the top octave and is phase-AWARE. That
+distinction decides results: Run 1 scored a healthy-looking 0.86 top-octave power
+ratio at Euclid while its phase-aware error was 1.10 -- worse than emitting
+nothing, having put roughly the right amount of power in the wrong place. That
+published claim was retracted. A phase-blind score cannot adjudicate
+deconvolution.
+
+*"Native" Nyquist* means each survey's OWN grid: the band is identical in pixel
+units but spans 0.10-0.20" of structure at HST and 0.53-1.05" at DES. So a
+cross-survey comparison asks "did the network exploit the resolution it was
+given?", not "did DES recover what HST recovered".
+
+**Two variants of this figure are emitted.** `fig3_survey_invariance` shows the
+noise-free test set only and is the one used where noise is not discussed;
+`fig3_survey_invariance_noise` overlays both test sets (solid marker =
+noise-free, hollow = survey noise) and carries the sim-to-real result. Both report identical numbers for the noise-free set.
+
+In the noise variant the with-noise points are **shifted slightly along x so
+their error bars do not overprint** the noise-free ones. The shift is
+presentational only: both members of a pair are the same survey at the same
+true pixel scale (and, in panel (c), the same PSF sigma). Marker size is
+identical for the two sets so neither is visually weighted above the other.
+
+Error bars are the 16-84th percentile over 1000 bootstrap resamples of the
+{n_lens} test lenses; the reference curves are plain means and carry none. Each
+figure draws from its own generator seeded from `--boot-seed`, so the intervals
+do not depend on which other figures were produced in the same run.
+
+{fig4_section}
+{fig5_section}
 
 ## Ablation status (axis 2 IS run -- this block used to claim otherwise)
 
@@ -1008,13 +1302,33 @@ def main():
     ap.add_argument("--profile-survey", default="HST",
                     help="survey whose radial power spectrum Fig 4a shows")
     ap.add_argument("--boot-seed", type=int, default=0)
+    ap.add_argument("--with-fig5", action="store_true",
+                    help="also emit fig5_noise_shift. OFF by default: its theta_E "
+                         "and top-octave panels are duplicated by "
+                         "fig3_survey_invariance_noise, and its reblur/floor panel "
+                         "divides by an analytic noise floor that omits the reblur "
+                         "operator's own error (38%% of Roman's true floor, which "
+                         "flips Roman from 1.87 to 0.65). Code kept so it can be "
+                         "reproduced on demand.")
+    ap.add_argument("--with-fig4", action="store_true",
+                    help="also emit fig4_deconvolution. OFF by default: its "
+                         "top-octave panel moved to Fig 3(c) and its remaining "
+                         "panels duplicate Fig 3(c) / Fig 5(c). The code is kept "
+                         "so the figure can be reproduced on demand.")
     ap.add_argument("--no-strict-layout", action="store_true",
                     help="warn instead of failing on the geometry self-check")
     args = ap.parse_args()
 
     t0 = time.time()
     os.makedirs(args.out_dir, exist_ok=True)
-    rng = np.random.default_rng(args.boot_seed)
+    # A FRESH generator per figure, all seeded the same. Sharing one generator
+    # made every figure's bootstrap CIs depend on which figures ran before it:
+    # the same Test Set 1 data appeared with different error bars in
+    # `fig3_survey_invariance` and `fig3_survey_invariance_noise`, and gating
+    # fig4 off silently shifted fig5's intervals. Point estimates were never
+    # affected -- they are deterministic -- but the intervals were.
+    def _rng():
+        return np.random.default_rng(args.boot_seed)
 
     if not os.path.exists(args.ckpt):
         raise SystemExit(f"checkpoint not found: {args.ckpt}\n"
@@ -1093,10 +1407,18 @@ def main():
     save_figure = lambda *a, **k: _sf(*a, **{**k, "strict": strict})  # noqa: E731
 
     fig_hero(ts1, [imgs_hero], args.out_dir, manifest, lens_ids=[median_idx])
-    fig_invariance(ts1, base1, args.out_dir, manifest, rng)
-    fig_deconvolution(ts1, base1, imgs_hero, args.out_dir, manifest, rng,
-                      profile_survey=args.profile_survey)
-    fig_noise_shift(ts1, ts2, base1, base2, imgs_ts2, args.out_dir, manifest, rng)
+    # Two variants: Test-Set-1-only for Representations (that paper does not
+    # discuss noise) and both test sets overlaid for Sim2Science, where the
+    # noise shift IS the result. Separate slugs, because slugs are provenance.
+    fig_invariance(ts1, base1, args.out_dir, manifest, _rng())
+    fig_invariance(ts1, base1, args.out_dir, manifest, _rng(), ts2=ts2,
+                   base2=base2, slug="fig3_survey_invariance_noise")
+    if args.with_fig4:
+        fig_deconvolution(ts1, base1, imgs_hero, args.out_dir, manifest, _rng(),
+                          profile_survey=args.profile_survey)
+    if args.with_fig5:
+        fig_noise_shift(ts1, ts2, base1, base2, imgs_ts2, args.out_dir, manifest,
+                        _rng())
     fig_hero(ts1, imgs_extra, args.out_dir, manifest, slug="figA1_hero_grid_appendix",
              lens_ids=extra,
              title="Appendix: three further lenses (last row block = worst case)")
@@ -1157,6 +1479,20 @@ def main():
           "noise-free inversion: an oracle-tuned Wiener is excellent on clean "
           "data, as theory requires, and collapses once its noise assumption "
           "is violated.")
+    # SSIM is measured but not plotted. State that it tracks L1 so its absence
+    # reads as a space decision, not a gap -- and state the margin difference,
+    # because SSIM is the more flattering of the two and an unexplained larger
+    # number invites the question.
+    from scipy.stats import spearmanr as _sp
+    _l1 = [float(np.mean(ts1[n]["l1_rel_masked"])) for n in SURVEY_ORDER]
+    _ss = [1.0 - float(np.mean(ts1[n]["ssim_norm"])) for n in SURVEY_ORDER]
+    _rho = _sp(_l1, _ss).correlation
+    ssim_note = (
+        f"Masked SSIM behaves the same way and is omitted only for space: it ranks "
+        f"the five surveys identically to this panel (Spearman rho = {_rho:.2f} "
+        f"against the L1 values, 1-SSIM spanning "
+        f"{min(_ss):.5f}-{max(_ss):.5f}), so it adds no independent ordering. "
+        f"Per-survey SSIM is in the appendix table.")
     signal_pct = 100.0 * float(np.mean(
         [np.mean(ts1[n]["mask_frac"]) for n in SURVEY_ORDER]))
     write_captions(args.out_dir, dict(
@@ -1166,7 +1502,12 @@ def main():
         rmse_lo=min(rmses), rmse_hi=max(rmses),
         factor=prior / max(rmses), factor_hi=prior / min(rmses), prior=prior,
         n_lens=args.n_lenses, profile_survey=args.profile_survey,
-        fail_note=fail_note, wiener_note=wiener_note))
+        fail_note=fail_note, wiener_note=wiener_note, ssim_note=ssim_note,
+        fig4_section=(FIG4_SECTION.format(profile_survey=args.profile_survey)
+                      if args.with_fig4 else FIG4_OMITTED),
+        fig5_section=(FIG5_SECTION.format(wiener_note=wiener_note,
+                                          fail_note=fail_note)
+                      if args.with_fig5 else FIG5_OMITTED)))
 
     with open(os.path.join(args.out_dir, "figure_manifest.json"), "w") as fh:
         json.dump(manifest, fh, indent=2)

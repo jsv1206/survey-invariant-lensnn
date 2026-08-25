@@ -44,45 +44,77 @@ reconstruction. The two objectives are not interchangeable.
 
 ## Figure allocation
 
-| | **Sim2Science** main text | **Representations** main text |
+**No appendix in either paper** (Aug 25). Everything not in the main text is still
+GENERATED and kept for later use — it is simply not allocated to these two submissions.
+
+| | **Sim2Science** | **Representations** |
 |---|---|---|
 | Fig 1 | hero grid | hero grid |
-| Fig 2 | architecture | architecture |
-| Fig 3 | survey invariance | survey invariance |
-| Fig 4 | deconvolution | deconvolution |
-| **Fig 5** | **noise shift** | **cross-attention ablation** |
-| appendix | A1 extra lenses, A2 loss ablation, A3 cross-attention | A1 extra lenses, A2 noise shift, A3 loss ablation |
+| Fig 2 | invariance, **noise variant** | invariance, noise-free |
+| Fig 3 | **cross-attention ablation** | **cross-attention ablation** |
 
-The two versions differ in exactly one main-text slot. Everything else is shared.
+**Generated but NOT in either paper:** `fig2_architecture`, `fig6_loss_ablation`,
+`figA1_hero_grid_appendix`, and (not emitted at all) `fig4_deconvolution`,
+`fig5_noise_shift`.
 
-**Decided Aug 24 after measuring** (the effect size was allowed to drive the layout, not
-the reverse): the **cross-attention** ablation takes the Representations main-text slot and
-the loss ablation moves to that paper's appendix. Removing cross-attention costs 1.64-9.98x
-in top-octave error at every survey (mean 2.75x) while leaving theta_E untouched, and the
-effect tracks PSF sampling at Spearman rho = -0.90 (p = 0.037). That is a mechanism, not
-just an ablation — and the theta_E null doubles as the control for the capacity confound.
-The loss ablation, by contrast, yields only two meaningful numbers.
+### Three consequences to decide on, not to discover late
+
+1. **RESOLVED (Aug 25):** cross-attention is now Fig 3 in BOTH papers, so Sim2Science has
+   three figures again. It is reduced to its single deconvolution panel (no heading), for
+   the page limits -- Sim2Science 5pp, Representations 4pp.
+
+   **Its other two results are still computed and written to
+   `fig7_cross_attention_data.csv` as `b_data` / `c_data`, and MUST be stated in the
+   text**, because the plotted panel alone does not carry them:
+   * *theta_E is unaffected* -- 0.0216" (joint) vs 0.0207" (no-cross), no-cross better at
+     3/5 surveys. This is the **control for the capacity confound**: the no-cross arm has
+     266,240 fewer parameters (13.9%), so "less capacity" explains the plotted panel until
+     you note the same reduction leaves regression untouched. A generic capacity deficit
+     degrades BOTH heads. Without this sentence the figure does not answer the first
+     question a referee asks.
+   * *Why theta_E survives*: it is a geometric quantity, set by the ring's position and
+     scale, which blur preserves. The PSF attenuates high spatial frequencies without
+     moving the ring, so what theta_E depends on survives convolution while the fine
+     structure the reconstruction head needs does not. That is why the two heads
+     dissociate.
+   * *The mechanism*: the effect tracks PSF sampling, Spearman rho = -0.90 (p = 0.037)
+     against sigma in native px -- Roman (0.46 px) 9.98x, Rubin (1.49 px) 1.94x.
+2. **Neither paper contains an architecture diagram.** `fig2_architecture` is generated
+   but unallocated, so the method — patch embedding, RoPE in arcsec, the three attention
+   paths, the two heads — must be carried entirely in prose. That is unusual for a method
+   paper and a referee may ask for it.
+3. **These claims now live ONLY in text**, because the figures that carried them are not
+   in the papers:
+   * *Reblur consistency* (the Sim2Science headline mechanism): on noisy input it flags
+     HST at **0.92x its own analytic noise floor** — below 1.0, i.e. fitting noise —
+     **without using ground truth**. Quote with the caveat that the analytic floor omits
+     the reblur operator's own error (38% of Roman's true floor).
+   * *Top-octave coherence*, the answer to "is this just sharpening artifacts?": trained
+     vs `identity` is 0.993/0.900 at HST, 0.975/0.615 at Rubin, 0.958/0.587 at DES. An
+     artifact raises power without raising coherence.
+   * *The loss-mode asymmetry*: reconstruction supervision helps theta_E by 16%
+     (0.0216" vs 0.0256"), while the theta_E objective costs deconvolution 94%
+     (0.037 vs 0.019).
 
 ## Slug ↔ figure-number mapping (READ THIS BEFORE EDITING LaTeX)
 
-Filenames are **frozen provenance** — they are referenced from `CLAUDE.md`,
-`HANDOFF_run1.md`, and both `figure_manifest.json` files. Do **not** rename or regenerate
-artifacts to match a venue's numbering.
+Filenames are **frozen provenance** and are referenced from `CLAUDE.md`,
+`HANDOFF_run1.md` and the manifests. Do **not** rename artifacts to match a venue's
+numbering. The digit inside a slug is historical and matches NEITHER venue.
 
 | file slug | Sim2Science | Representations |
 |---|---|---|
 | `fig1_hero_grid` | Fig 1 | Fig 1 |
-| `fig2_architecture` | Fig 2 | Fig 2 |
-| `fig3_survey_invariance` | Fig 3 | Fig 3 |
-| `fig4_deconvolution` | Fig 4 | Fig 4 |
-| `fig5_noise_shift` | **Fig 5** | Fig A2 |
-| `fig6_loss_ablation` | Fig A2 | Fig A3 |
-| `fig7_cross_attention` | Fig A3 | **Fig 5** |
-| `figA1_hero_grid_appendix` | Fig A1 | Fig A1 |
+| `fig3_survey_invariance_noise` | **Fig 2** | — |
+| `fig3_survey_invariance` | — | **Fig 2** |
+| `fig7_cross_attention` | **Fig 3** | **Fig 3** |
+| `fig2_architecture` | *not in paper* | *not in paper* |
+| `fig6_loss_ablation` | *not in paper* | *not in paper* |
+| `figA1_hero_grid_appendix` | *not in paper* | *not in paper* |
+| `fig4_deconvolution` | *not emitted* | *not emitted* |
+| `fig5_noise_shift` | *not emitted* | *not emitted* |
 
-**The digit inside a slug reflects Sim2Science ordering and is NOT authoritative for the
-representations version.** Use `\label`/`\ref` in LaTeX so numbering follows position in
-the document, never the filename.
+Use `\label`/`\ref` in LaTeX so numbering follows position, never the filename.
 
 ## Output contract (every figure, both venues)
 

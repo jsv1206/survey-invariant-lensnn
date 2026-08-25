@@ -79,17 +79,24 @@ the rule (`tests/test_baselines.py`).
 
 ## 4. Core results (shared by both papers)
 
-### 4.1 Survey invariance — accuracy is flat across a 5.3× pixel-scale range
+### 4.1 Survey invariance — accuracy is NEARLY flat across a 5.3× pixel-scale range
 
-θ_E RMSE, Test Set 1 (`fig3_survey_invariance_data.csv`):
+theta_E error, Test Set 1 (`fig3_survey_invariance_data.csv`), reported as a **fraction of
+the true theta_E** because a percentage is interpretable against the truth where an
+absolute arcsec value needs the 0.5-2.5" prior to mean anything:
 
-| HST | Euclid | Roman | Rubin | DES | prior-mean null |
+| | HST | Euclid | Roman | Rubin | DES |
 |---|---|---|---|---|---|
-| 0.0170″ | 0.0164″ | 0.0215″ | 0.0227″ | 0.0306″ | **0.618″** |
+| fractional RMSE | 1.37% | 1.34% | 1.72% | 2.37% | **3.69%** |
+| absolute RMSE | 0.0170" | 0.0164" | 0.0215" | 0.0227" | 0.0306" |
+| median \|frac\| | 0.66% | 0.67% | 0.79% | 1.01% | 1.38% |
 
-**20–38× better than the null**, varying only **1.9×** across a **5.3×** pixel-scale
-range. Report the residual trend honestly: DES is 1.9× worse than Euclid and that trend
-correlates with pixel scale — "flat" means "nearly flat", not "exactly flat".
+**20-36x better than the prior-mean null** (0.618", §4.5). But say **"nearly flat"**, never
+"flat": there is a monotonic **2.75x** trend with pixel scale. Note the fractional metric
+makes that trend LARGER than absolute RMSE does (1.87x), because per-lens normalization
+up-weights small-theta_E systems where a fixed positional error is a bigger fraction. That
+is the honest presentation, and the trend was invisible in earlier drafts only because a
+baseline line forced a 162x y-axis.
 
 ### 4.2 Deconvolution vs classical Wiener — NOT a clean sweep
 
@@ -125,11 +132,135 @@ The reblur diagnostic independently flags HST **without ground truth**: it sits 
 failure mode, not a win. That is the sim2real hook: the same diagnostic runs unchanged on
 real images.
 
+### 4.4 The figure set, and what each figure is allowed to claim
+
+**Three figures per paper, no appendix.** Everything else is still generated and kept,
+but is not allocated to these submissions.
+
+| | Sim2Science (5pp) | Representations (4pp) |
+|---|---|---|
+| Fig 1 | `fig1_hero_grid` | `fig1_hero_grid` |
+| Fig 2 | `fig3_survey_invariance_noise` | `fig3_survey_invariance` |
+| Fig 3 | `fig7_cross_attention` | `fig7_cross_attention` |
+
+Generated but unallocated: `fig2_architecture`, `fig6_loss_ablation`,
+`figA1_hero_grid_appendix`. Not emitted at all: `fig4_deconvolution`, `fig5_noise_shift`
+(code retained behind `--with-fig4` / `--with-fig5`).
+
+**Slugs are frozen provenance and their digits are historical — they match NEITHER
+venue's numbering.** Resolve numbers with `\label`/`\ref`, never from a filename.
+
+#### Fig 1 — one lens, five telescopes
+
+COLUMNS are surveys ordered by pixel scale; ROWS are `input g` / `recon f_hat` /
+`truth f_gt` / `residual`. Every panel of a COLUMN is divided by that column's `f_gt`
+peak, printed in the header as `S_peak`, so columns are internally consistent and
+comparable to each other despite a **15.3x** spread in flux per pixel.
+
+* `S` is flux **per pixel** in arbitrary simulator units — there is no photometric
+  zeropoint (`src_amp ~ U(2,6)`). It is NOT surface brightness: lenstronomy returns flux
+  per pixel and `_area_resample` SUMS to conserve it, which is exactly why `S_peak` varies
+  across surveys at all. True surface brightness would be roughly survey-independent.
+* The input panel peaks BELOW 1.0 on purpose: the normalization is by the TRUTH's peak,
+  and blurring spreads flux and lowers the peak.
+* The residual row is drawn on **+/-0.05**, a 20x tighter scale than the image rows. It
+  was +/-0.30 (inherited from Run 2, when the model was worse), which rendered
+  HST/Euclid/Roman as blank white and hid the cross-survey ordering entirely. At 0.05 only
+  ~0.5% of pixels saturate, at Rubin and DES, and that saturation is the point.
+* One lens, chosen as the **median** masked-L1 case (index 59 of 200) — deliberately not
+  the best.
+
+#### Fig 2 — invariance, in two variants
+
+One row, three panels. Both variants report identical numbers for the noise-free set.
+
+| panel | metric | x axis |
+|---|---|---|
+| (a) | theta_E **fractional** RMSE (%) | pixel scale (log) |
+| (b) | relative L1, % of arc flux, + `identity` | pixel scale (log) |
+| (c) | high-freq. octave error, dimensionless, + `identity` + Wiener | **PSF sigma (native px)** |
+
+* **Panel (c) uses a different x on purpose.** The effect tracks PSF SAMPLING: Spearman
+  rho = +0.90 (p = 0.037) against sigma_px versus +0.60 (p = 0.285, not significant)
+  against pixel scale. A one-row layout shares no axis, so mixed x costs nothing.
+* **Panel (c) is deliberately NOT a percentage** while (a) and (b) are. It divides squared
+  amplitudes, so x100 would be a fraction of POWER beside two fractions of FLUX: HST reads
+  1.68% in power but 13.0% in amplitude. Adjacency alone would manufacture that
+  misreading. The documented convention is that emitting nothing scores exactly 1.0.
+* **Fractional, not absolute, theta_E error** — a percentage is directly interpretable
+  where "0.017 arcsec" needs the 0.5-2.5" prior to mean anything. It is also a HARDER
+  test: per-lens normalization up-weights small-theta_E systems, so the cross-survey
+  spread is 2.75x rather than 1.87x. Say "nearly flat", never "flat".
+* In the noise variant, solid = noise-free and hollow = survey noise, with the noisy
+  points nudged along x so the error bars do not overprint. The nudge is presentational;
+  both members of a pair are the same survey at the same true x.
+* No prior-mean baseline is drawn: the 0.618" line forced a 162x y-span that left the data
+  in the bottom 1.1% of the axis. The number is kept in 4.5 for referees.
+
+#### Fig 3 — cross-attention, one panel
+
+Deconvolution error, joint vs no-cross, per survey. **Its other two results are computed
+and written to `fig7_cross_attention_data.csv` as `b_data` / `c_data`, and MUST appear in
+the text** — see 5.1. Without them the panel does not answer the capacity objection.
+
+### 4.5 How every baseline / reference number is computed
+
+None of these is a fit, a separate trained model, or an interpolation.
+
+**`identity`** — return the blurred input unchanged, `f_hat = g`. Same metric as the
+trained curve with one substitution: normalize both by the same per-sample `f_gt` peak,
+mask to `f_gt > 1% of peak`, take the relative L1, average over the 200 lenses. **The mask
+is built from the TRUTH**, so trained and `identity` are scored on byte-identical pixels.
+
+| survey | mask_frac | `identity` | trained | margin |
+|---|---|---|---|---|
+| HST | 5.8% | 8.80% | 1.17% | 7.5x |
+| Euclid | 6.5% | 14.71% | 2.00% | 7.4x |
+| Roman | 6.7% | 9.27% | 1.95% | 4.8x |
+| Rubin | 7.7% | 56.71% | 9.40% | 6.0x |
+| DES | 8.2% | 62.76% | 13.33% | 4.7x |
+
+It is load-bearing, not decoration: trained L1 rises **22x** HST->DES, which alone reads as
+the method degrading; `identity` rises **13x** over the same range, so the correct reading
+is that the PROBLEM got harder while the margin held at 4.7-7.5x. It is also a genuinely
+STRONG baseline here, because masked L1 is low-frequency dominated and `g` is already close
+to `f_gt` there. CLAUDE.md: the deconvolution claim requires beating `identity`, **not
+merely `zeros`**.
+
+Caveats: the baseline curves carry **no error bars** (only the trained points are
+bootstrapped), and `mask_frac` is not constant across surveys (5.8% -> 8.2%) because the
+mask is defined on the truth in NATIVE pixels. That does not bias the within-survey
+comparison, but a little of the cross-survey trend in the `identity` curve is that effect.
+
+**`zeros`** — `f_hat = 0`. 2-12x worse than `identity`, so beating `identity` implies it.
+In the CSVs; **not plotted**.
+
+**`prior_mean`** — always predict the test set's mean theta_E (1.4716"), ignoring the
+image. Its RMSE is therefore the sample's own standard deviation: **0.6184"**. The prior is
+`theta_E ~ U(0.5, 2.5)"` (population sd 0.5774; this draw sits ~7% high, within scatter for
+n=200). Identical at all five surveys — a consistency check, since the paired design sends
+the SAME 200 lenses through every telescope. **Not plotted** (it forced a 162x y-span), but
+Run 3 sits at 1.34-3.69% fractional error, i.e. **20-36x** better than this null.
+
+**Masked SSIM** — measured, never plotted. It ranks the surveys **identically** to the L1
+panel (Spearman rho = 1.00), so it adds no independent ordering. It is also the more
+flattering metric: 1-SSIM sits 18-49x below `identity` against L1's 4.7-7.5x. Available in
+the per-run metrics CSVs.
+
+**reblur operator floor** — the residual `||f_hat*h - g||^2/mean(g^2)` cannot reach zero
+even for a PERFECT reconstruction, because `losses.reblur` is not an exact inverse of the
+simulator's convolve-then-resample forward model. Feeding `f_hat = f_gt` gives the floor,
+which spans **211x** across surveys and tracks PSF sampling, not survey quality (Roman's
+stamp aliases at sigma = 0.46 px, dataset bug 3). **Always report the RATIO, never the raw
+residual**: raw, Roman looks worst by 3x when it is in fact sitting ON its floor and is the
+best of the five. Per-sample ratios are heavy-tailed — quote the MEDIAN (HST 7.5) not the
+mean (HST 119).
+
 ---
 
 ## 5. Ablations
 
-### 5.1 Axis 1 — PSF cross-attention (NEW; Representations main text)
+### 5.1 Axis 1 — PSF cross-attention (Fig 3 in BOTH papers)
 
 One flag apart from the joint arm; verified the checkpoints differ in
 `use_cross_attention` **and nothing else**. Cross-attention is the **only** path from the
@@ -163,6 +294,11 @@ Mechanism: an under-sampled PSF has its spectral cutoff near Nyquist where it is
 resolved, so the blur cannot be inferred from the image and being *told* it matters
 enormously; a wide PSF announces itself in the image's spectral falloff.
 
+**This ranking is the OPPOSITE of the difficulty ranking in §4.4, and the two must not be
+conflated.** Deconvolution is hardest at Rubin/DES (their PSF destroys the most
+information); knowing the PSF helps most at Roman/Euclid (their PSF is hardest to infer
+from the image). Different questions, opposite orderings.
+
 **The capacity confound is controlled by the design.** Removing cross-attention removes
 266,240 params (13.9%), so "less capacity" is a live alternative explanation for the
 deconvolution gap — except the *same* reduction leaves regression unharmed. A generic
@@ -175,7 +311,7 @@ per-sample* conditioning. A weaker no-cross result therefore does not mean the P
 is unnecessary in general — only that within this PSF family (Gaussian, spatially
 invariant, `fwhm ~ logU(0.08,1.1)″`) some of the blur is inferable from the image.
 
-### 5.2 Axis 2 — loss mode (Sim2Science appendix; Representations appendix)
+### 5.2 Axis 2 — loss mode (measured; NOT in either paper, text-only)
 
 | comparison | joint | single-task | effect |
 |---|---|---|---|
@@ -205,44 +341,63 @@ SSIM+FFT) not run. Say "not evaluated", never imply they were.
 
 ## 6. Per-venue framing
 
-### 6.1 Sim2Science — *leveraging imperfect simulators against real data*
+Both papers: **three figures, no appendix.** Figs 1 and 3 are shared; only Fig 2 differs.
 
-**Thesis.** The reblur consistency loss needs no ground truth, so the same objective and
-the same diagnostic that train the model on simulations also run unchanged on real images;
-survey invariance is robustness to per-instrument simulator mis-specification.
+### 6.1 Sim2Science (5 pp) — *leveraging imperfect simulators against real data*
 
-**Lead with:** §4.3 (noise shift) and §4.2's TS2 column. The model is trained on a
-noise-free simulator and evaluated on realistic per-survey noise with no retraining and no
-augmentation — and it beats an oracle-tuned classical filter by 4.0–8.7× where that filter's
-noise assumption breaks.
+**Thesis.** The reblur consistency loss needs no ground truth, so the objective and the
+diagnostic that train the model on simulations run unchanged on real images; survey
+invariance is robustness to per-instrument simulator mis-specification.
 
-**Figure order:** 1 hero · 2 architecture · 3 invariance · 4 deconvolution · **5 noise
-shift**. Appendix: A1 extra lenses, A2 loss ablation, A3 cross-attention.
+**Lead with** the noise variant of Fig 2: trained noise-free, evaluated on realistic
+per-survey noise with no retraining and no augmentation, and still beating an oracle-tuned
+Wiener by 4.0-8.7x at four of five surveys once that filter's noise assumption breaks.
 
-**The honest-reporting angle is an asset here.** HST fails under noise (1.029 > 1.0) and we
-report it; the reblur diagnostic catches it *without ground truth* at 0.92× its floor.
-"The noise-free simulator does not transfer without augmentation at HST" is a legitimate
-and publishable Sim2Science result.
+**Figures:** 1 hero · 2 invariance (noise variant) · 3 cross-attention.
 
-### 6.2 Representations — *symmetry / geometry / structure in learned representations*
+**The honest-reporting angle is an asset here.** HST fails under noise (top-octave 1.029 >
+1.0) and the paper says so; the reblur diagnostic catches it **without ground truth** at
+0.92x its own floor. "The noise-free simulator does not transfer without augmentation at
+HST" is a legitimate and publishable Sim2Science result.
 
-**Thesis.** One encoder, invariant to pixel scale and PSF across a 5.3× range, with **RoPE
-positions in arcseconds rather than pixel indices** as the mechanism — a symmetry
-statement: a 0.1″ offset must rotate identically for HST and Rubin.
+### 6.2 Representations (4 pp) — *symmetry / geometry in learned representations*
 
-**Lead with:** §4.1 (invariance) and §5.1 (cross-attention). The cross-attention result
-says what the representation *needs*: explicit access to the instrument response for
-high-frequency recovery, and nothing extra for the geometric quantity. The σ_px trend
-(ρ = −0.90) turns that from an ablation into a mechanism.
+**Thesis.** One encoder invariant to pixel scale and PSF across a 5.3x range, with **RoPE
+positions in arcseconds rather than pixel indices** as the mechanism — a symmetry claim: a
+0.1" offset must rotate identically for HST and Rubin.
 
-**Figure order:** 1 hero · 2 architecture · 3 invariance · 4 deconvolution ·
-**5 cross-attention**. Appendix: A1 extra lenses, A2 noise shift, A3 loss ablation.
+**Lead with** Fig 2 (invariance) and Fig 3 (cross-attention). The cross-attention result
+says what the representation NEEDS: explicit access to the instrument response for
+high-frequency recovery, and nothing extra for the geometric quantity.
+
+**Figures:** 1 hero · 2 invariance (noise-free) · 3 cross-attention.
 
 **Strongest available sentence:** *the two heads dissociate.* The same architectural
-removal destroys deconvolution (2.75× mean, up to 9.98×) and leaves Einstein-radius
-regression untouched — a double dissociation that also controls the capacity confound.
+removal destroys deconvolution (2.75x mean, up to 9.98x) and leaves Einstein-radius
+regression untouched — a double dissociation that simultaneously controls the capacity
+confound.
 
----
+### 6.3 What is text-only in BOTH papers
+
+No figure carries these any more. Each is measured and quotable from a CSV:
+
+* **Reblur consistency** — on noisy input it flags HST at **0.92x its own analytic noise
+  floor** (below 1.0 = fitting noise) **without using ground truth**. Caveat if quoted: the
+  analytic floor omits the reblur operator's own error, which is 38% of Roman's true floor.
+* **Top-octave coherence**, the answer to "is this just sharpening artifacts?" — trained vs
+  `identity`: 0.993/0.900 HST, 0.975/0.615 Rubin, 0.958/0.587 DES. An artifact raises power
+  without raising coherence.
+* **theta_E is unaffected by removing cross-attention** — 0.0216" vs 0.0207", no-cross
+  better at 3/5. This is the **capacity control** (§5.1) and must be stated, not omitted.
+* **Why theta_E survives blur** — it is geometric, set by the ring's position and scale.
+  The PSF attenuates high spatial frequencies without moving the ring, so what theta_E
+  depends on survives convolution while the fine structure the reconstruction head needs
+  does not. That is why the heads dissociate.
+* **The loss-mode asymmetry** — reconstruction supervision helps theta_E by 16%
+  (0.0216" vs 0.0256"); the theta_E objective costs deconvolution 94% (0.037 vs 0.019).
+* **The architecture** — `fig2_architecture` is generated but unallocated, so patch
+  embedding, arcsec RoPE, the three attention paths and the two heads must be described in
+  prose. Unusual for a method paper; a referee may ask for the diagram.
 
 ## 7. Limitations to state (both venues)
 
@@ -265,11 +420,46 @@ regression untouched — a double dissociation that also controls the capacity c
    demonstrates it. It is a ~10-line change plus one run — the obvious next experiment,
    and worth naming as such in the paper rather than leaving the gap silent.
 
-## 8. Provenance
+## 8. Provenance and how to regenerate
 
-All figures re-runnable from checkpoint + cached data with no manual steps. Each figure
-ships `figN_*_data.csv` with exactly the plotted numbers, plus a manifest recording
-checkpoint path and hash, dataset digest, git commit and script version. Three scripts
-write into `figures/run3/paper/` with non-colliding manifest names
-(`make_paper_figures.py`, `make_ablation_figures.py`, `make_fig2_architecture.py`).
-Run 2 (FOV 20″, `figures/paper/`) is frozen provenance and is never regenerated.
+Every figure is re-runnable from the checkpoint plus the cached dataset with no manual
+steps, and ships `<slug>_data.csv` containing exactly the plotted numbers. **Quote the
+CSV, never the plot.**
+
+```bash
+ROOT=/deepskieslab/stronglensing/survey-invariant-lensnn
+CK=$ROOT/runs/run3_joint_fov12/version_0/checkpoints/last.ckpt
+
+# Figs 1 and 2 (both variants) + figA1
+PYTHONPATH=src python -m survey_lens.make_paper_figures \
+    --ckpt $CK --out-dir figures/run3/paper --fov 12.0 --device cuda --workers 8
+
+# Fig 3 (+ the unallocated loss ablation)
+PYTHONPATH=src python -m survey_lens.make_ablation_figures \
+    --joint-ckpt $CK \
+    --recon-ckpt   $ROOT/runs/run3_recon_fov12/version_0/checkpoints/last.ckpt \
+    --reg-ckpt     $ROOT/runs/run3_reg_fov12/version_0/checkpoints/last.ckpt \
+    --nocross-ckpt $ROOT/runs/run3_nocross_fov12/version_0/checkpoints/last.ckpt \
+    --out-dir figures/run3/paper --fov 12.0 --device cuda --workers 8
+
+# architecture schematic (unallocated; reads its constants from model.py)
+PYTHONPATH=src python -m survey_lens.make_fig2_architecture \
+    --out-dir figures/run3/paper --fov 12.0
+```
+
+`--fov 12.0` is mandatory: the checkpoint does not record its FOV.
+
+**Three scripts write into `figures/run3/paper/`** with non-colliding manifest names
+(`figure_manifest{,_ablation,_fig2}.json`, `captions{,_ablation}.md`). Before the suffixes
+existed, whichever ran second silently destroyed the other's captions and provenance. Any
+new figure script added there needs the same treatment.
+
+**Each figure seeds its own bootstrap generator** from `--boot-seed`, so intervals do not
+depend on which other figures ran in the same process. They used to: a shared generator
+meant gating one figure off silently shifted every later figure's error bars.
+
+**Retained but not emitted:** `--with-fig4` (deconvolution) and `--with-fig5` (noise
+shift). Both produce a caption explaining their status; fig 5's records that its
+reblur/floor panel was wrong at Roman.
+
+**Run 2** (FOV 20", `figures/paper/`) is frozen provenance — never regenerated or moved.

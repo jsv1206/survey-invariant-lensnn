@@ -1,9 +1,9 @@
 {
   "script": "survey_lens/make_fig2_architecture.py",
   "script_version": "1.0.0",
-  "generated_utc": "2026-08-23T21:02:37Z",
+  "generated_utc": "2026-08-24T23:14:07Z",
   "git": {
-    "commit": "8051ad9dd4553248944bfe3cc70d11522787d7f5",
+    "commit": "b5ac6fab82cad3559a689a5581a60ea4695956e9",
     "working_tree": "dirty"
   },
   "fov_arcsec": 12.0,

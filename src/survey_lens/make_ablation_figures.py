@@ -204,7 +204,7 @@ def fig_loss_ablation(res, base, out_dir, manifest, rng):
         rows.append(dict(panel="b", metric="wiener", arm="wiener", survey=nm,
                          value=wv, degenerate=False))
     ax.set_xticks(x); ax.set_xticklabels(SURVEY_ORDER)
-    ax.set_ylabel("top-octave complex error")
+    ax.set_ylabel("high-freq. octave error")
     ax.set_title("(b) deconvolution: does the $\\theta_E$ loss hurt?\n"
                  "$\\theta_E$-only lands exactly on identity (degenerate)",
                  fontsize=FS_SMALL)
@@ -240,28 +240,37 @@ def _sigma_px(nm):
 def fig_cross_attention(res, base, out_dir, manifest, rng):
     """Ablation axis 1: PSF cross-attention on/off, joint loss, one flag apart.
 
-    Three panels because the result has three parts, and the third is the one
-    that explains the other two:
-      (a) deconvolution collapses without it -- at EVERY survey
-      (b) theta_E does NOT -- the geometric quantity survives blur
-      (c) the size of the effect tracks PSF SAMPLING, which is the mechanism
+    ONE panel is plotted -- deconvolution error, joint vs no-cross, per survey --
+    because both venues are page-limited (Sim2Science 5pp, Representations 4pp).
 
-    (b) is not padding. It is the internal control for the capacity confound:
-    the no-cross arm has 13.9% fewer parameters, so "less capacity" is a live
-    alternative explanation for (a) -- until you notice the SAME parameter
-    reduction leaves regression untouched. A generic capacity deficit would hurt
-    both heads; only the reconstruction pathway degrades.
+    The other two parts of the result are still COMPUTED and written to the data
+    CSV, because they must be quoted in the text and the paper quotes the CSV:
+
+      panel `b_data` -- theta_E is NOT affected. 0.0216" (joint) vs 0.0207"
+        (no-cross), no-cross marginally better and better at 3/5 surveys. This
+        is not a footnote: it is the internal control for the capacity confound.
+        The no-cross arm has 266,240 fewer parameters (13.9%), so "less
+        capacity" is a live alternative explanation for the plotted panel --
+        until you notice the SAME reduction leaves regression untouched. A
+        generic capacity deficit degrades both heads; only the reconstruction
+        pathway does. **Without this in the text, the figure alone does not
+        answer the first question a referee will ask.**
+
+      panel `c_data` -- the effect tracks PSF SAMPLING: Spearman rho = -0.90
+        (p = 0.037) against sigma in native pixels. An under-sampled PSF has its
+        cutoff near Nyquist where it is poorly resolved, so the blur cannot be
+        inferred from the image and being told it matters enormously (Roman,
+        sigma = 0.46 px, 9.98x); a wide PSF announces itself in the image's
+        spectral falloff (Rubin, sigma = 1.49 px, 1.94x). This is the mechanism,
+        and it is why this ablation was promoted over the loss ablation.
     """
     from scipy.stats import spearmanr
     plt = _mpl()
-    fig = plt.figure(figsize=(TEXT_W, 3.75))
-    gs = fig.add_gridspec(2, 2, height_ratios=[1.0, 0.92], hspace=0.62, wspace=0.34,
-                          left=0.105, right=0.985, top=0.93, bottom=0.105)
-    # (a) and (b) share the top row; (c) gets the FULL width underneath, because
-    # five survey labels do not fit in a third of the text width -- Roman, Euclid
-    # and HST all sit below sigma=0.9 px and Rubin/DES are 2% apart.
-    axes = [fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[0, 1]),
-            fig.add_subplot(gs[1, :])]
+    fig, ax_main = plt.subplots(1, 1, figsize=(3.3, 2.5))
+    # The two unplotted panels still run: they populate the data CSV so the text
+    # can quote them. They draw onto a throwaway figure that is never saved.
+    _scratch = plt.figure()
+    axes = [ax_main, _scratch.add_subplot(2, 1, 1), _scratch.add_subplot(2, 1, 2)]
     rows = []
     x = np.arange(len(SURVEY_ORDER))
     w = 0.34
@@ -283,8 +292,8 @@ def fig_cross_attention(res, base, out_dir, manifest, rng):
                yerr=[los, his], capsize=1.6, error_kw=dict(lw=0.7, ecolor=INK_2))
     ax.set_yscale("log")
     ax.set_xticks(x); ax.set_xticklabels(SURVEY_ORDER, rotation=45, ha="right")
-    ax.set_ylabel("top-octave complex error")
-    ax.set_title("(a) deconvolution collapses", fontsize=FS_SMALL)
+    ax.set_ylabel("high-freq. octave error")
+
     ax.legend(loc="upper left", frameon=False, fontsize=FS_TINY - 0.5,
               handletextpad=0.4, borderpad=0.1, labelspacing=0.2)
     _no_minor_labels(ax)
@@ -297,7 +306,7 @@ def fig_cross_attention(res, base, out_dir, manifest, rng):
             r = res[arm]["ts1"][nm]
             pt, lo, hi = boot_ci_paired(r["theta_pred"], r["theta_true"], _rmse, rng)
             vals.append(pt); los.append(pt - lo); his.append(hi - pt)
-            rows.append(dict(panel="b", metric="theta_rmse", arm=arm, survey=nm,
+            rows.append(dict(panel="b_data", metric="theta_rmse", arm=arm, survey=nm,
                              value=pt, ci_lo=lo, ci_hi=hi))
         ax.bar(x + (k - 0.5) * w, vals, width=w - 0.05, alpha=alpha,
                color=[SURVEY_COLORS[n] for n in SURVEY_ORDER],
@@ -322,7 +331,7 @@ def fig_cross_attention(res, base, out_dir, manifest, rng):
         pt = float(np.mean(b) / np.mean(a))
         lo, hi = np.percentile(draws, [16, 84])
         sig.append(_sigma_px(nm)); ben.append(pt); blo.append(pt - lo); bhi.append(hi - pt)
-        rows.append(dict(panel="c", metric="benefit_ratio", arm="no_cross/joint",
+        rows.append(dict(panel="c_data", metric="benefit_ratio", arm="no_cross/joint",
                          survey=nm, value=pt, ci_lo=lo, ci_hi=hi,
                          sigma_px=_sigma_px(nm)))
         ax.errorbar(sig[-1], pt, yerr=[[blo[-1]], [bhi[-1]]], fmt=SURVEY_MARKERS[nm],
@@ -353,6 +362,8 @@ def fig_cross_attention(res, base, out_dir, manifest, rng):
 
     manifest["cross_attention_spearman"] = dict(rho=float(rho), p=float(pval),
                                                 n=len(SURVEY_ORDER))
+    plt.close(_scratch)          # never saved; only ran to populate `rows`
+    fig.tight_layout()
     save_figure(fig, out_dir, "fig7_cross_attention", pd.DataFrame(rows), manifest)
 
 
@@ -387,7 +398,8 @@ joint model is better at every survey -- so the confound works AGAINST the
 result reported here, which makes the conclusion stronger than the design alone
 could guarantee. {consistency_a}
 
-(b) **Deconvolution.** Top-octave complex error per survey, joint vs recon-only,
+(b) **Deconvolution.** High-freq. octave error per survey (defined at the end of
+this file), joint vs recon-only,
 with the `identity` and Wiener references. The metric is normalized so that
 emitting nothing scores exactly 1.0, and it is phase-aware -- a power ratio
 alone is gameable. This isolates what the theta_E objective costs (or buys)
@@ -427,6 +439,50 @@ unchanged. This ablation is self-contained at FOV 12" with the corrected reblur
 operator, so its arms are mutually comparable; its absolute numbers are not
 directly comparable to Run 2's, which is why all three arms were retrained here
 rather than reusing Run 2 as the joint arm.
+
+## Definitions -- training LOSS TERMS vs evaluation METRICS
+
+These are two different families and must not be conflated. The model is
+optimized on the loss terms; the figures report the metrics.
+
+**Training objective** (`losses.py`, weights from `lit_model.py`):
+
+| term | what it is | weight |
+|---|---|---|
+| L1 | `0.5*(masked + global)` mean abs. difference, both images divided by the `f_gt` peak. Half of it covers empty sky ON PURPOSE, as anti-hallucination pressure | 1.0 |
+| SSIM | `1 - ssim(f_hat, f_gt)`, peak-normalized | 0.5 |
+| FFT | L1 between the MAGNITUDE spectra, **all** frequencies -- phase-BLIND | 0.1 |
+| reblur | `\|f_hat*h - g\|^2 / mean(g^2)`, scale-free, needs no ground truth | 0.1 |
+| regression | MSE on theta_E | 1.0 |
+
+**Evaluation metrics** (what the figures plot):
+
+| name in figures | definition |
+|---|---|
+| theta_E frac. RMSE (%) | RMS of the per-lens `(pred-true)/true` |
+| L1 error (% of arc flux) | `sum\|f_hat - f_gt\| / sum(f_gt)` inside `f_gt > 1% of peak` |
+| **high-freq. octave error** | `sum\|F_hat - F_gt\|^2 / sum\|F_gt\|^2` over 0.5-1.0x the native Nyquist. Normalized so emitting nothing scores exactly **1.0**, a perfect reconstruction 0; above 1.0 is worse than emitting nothing |
+| reblur / floor | reblur residual over the floor an ORACLE reconstruction still leaves |
+
+**Two traps worth stating explicitly.**
+
+*The metrics are not the loss terms of the same name.* The L1 metric is masked and
+normalized by arc flux; the L1 loss term is half-weighted onto empty sky and
+normalized by peak. They are related, not equal.
+
+*The high-freq. octave error is NOT the FFT loss term.* The FFT term differences
+magnitude spectra over all frequencies and is therefore phase-BLIND; the metric
+differences COMPLEX coefficients in the top octave and is phase-AWARE. That
+distinction decides results: Run 1 scored a healthy-looking 0.86 top-octave power
+ratio at Euclid while its phase-aware error was 1.10 -- worse than emitting
+nothing, having put roughly the right amount of power in the wrong place. That
+published claim was retracted. A phase-blind score cannot adjudicate
+deconvolution.
+
+*"Native" Nyquist* means each survey's OWN grid: the band is identical in pixel
+units but spans 0.10-0.20" of structure at HST and 0.53-1.05" at DES. So a
+cross-survey comparison asks "did the network exploit the resolution it was
+given?", not "did DES recover what HST recovered".
 """
 
 

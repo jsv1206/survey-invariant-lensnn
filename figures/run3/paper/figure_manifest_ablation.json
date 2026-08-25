@@ -1,7 +1,7 @@
 {
   "script": "survey_lens/make_ablation_figures.py",
   "script_version": "1.1.0",
-  "generated_utc": "2026-08-24T03:25:45Z",
+  "generated_utc": "2026-08-25T05:49:58Z",
   "checkpoints": {
     "joint": "/deepskieslab/stronglensing/survey-invariant-lensnn/runs/run3_joint_fov12/version_0/checkpoints/last.ckpt",
     "recon_only": "/deepskieslab/stronglensing/survey-invariant-lensnn/runs/run3_recon_fov12/version_0/checkpoints/last.ckpt",
@@ -9,7 +9,7 @@
     "no_cross": "/deepskieslab/stronglensing/survey-invariant-lensnn/runs/run3_nocross_fov12/version_0/checkpoints/last.ckpt"
   },
   "git": {
-    "commit": "8051ad9dd4553248944bfe3cc70d11522787d7f5",
+    "commit": "b5ac6fab82cad3559a689a5581a60ea4695956e9",
     "working_tree": "dirty"
   },
   "fov_arcsec": 12.0,
