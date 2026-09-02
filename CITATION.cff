@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "Survey-invariant strong-lens embedding network"
+authors:
+  - name: "Anonymous"
+version: 0.1.0
+license: MIT
+keywords:
+  - strong gravitational lensing
+  - cosmology
+  - deep learning
+  - simulation-based inference

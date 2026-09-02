@@ -1,0 +1,53 @@
+{
+  "script": "survey_lens/make_ablation_figures.py",
+  "script_version": "1.1.0",
+  "generated_utc": "2026-08-28T15:24:39Z",
+  "checkpoints": {
+    "joint": "runs/run3_joint_fov12/version_0/checkpoints/last.ckpt",
+    "recon_only": "runs/run3_recon_fov12/version_0/checkpoints/last.ckpt",
+    "reg_only": "runs/run3_reg_fov12/version_0/checkpoints/last.ckpt",
+    "no_cross": "runs/run3_nocross_fov12/version_0/checkpoints/last.ckpt"
+  },
+  "git": {
+    "commit": "6906caef150071dc4c4c745bf1b5e237341adcb0",
+    "working_tree": "dirty"
+  },
+  "fov_arcsec": 12.0,
+  "n_lenses": 200,
+  "seed": 12345,
+  "test_set_1_digest": "dbfb889d201e8ba7",
+  "test_set_2_digest": "d4723173a8169874",
+  "bootstrap": {
+    "n": 1000,
+    "seed": 0
+  },
+  "reg_only_recon_equals_identity": "CONFIRMED degenerate",
+  "figures": {
+    "fig6_loss_ablation": {
+      "pdf": "fig6_loss_ablation.pdf",
+      "png": "fig6_loss_ablation.png",
+      "data_csv": "fig6_loss_ablation_data.csv",
+      "n_rows": 45,
+      "layout_check": "clean"
+    },
+    "fig7b_cross_attention_theta": {
+      "pdf": "fig7b_cross_attention_theta.pdf",
+      "png": "fig7b_cross_attention_theta.png",
+      "data_csv": "fig7b_cross_attention_theta_data.csv",
+      "n_rows": 10,
+      "layout_check": "clean"
+    },
+    "fig7_cross_attention": {
+      "pdf": "fig7_cross_attention.pdf",
+      "png": "fig7_cross_attention.png",
+      "data_csv": "fig7_cross_attention_data.csv",
+      "n_rows": 25,
+      "layout_check": "clean"
+    }
+  },
+  "cross_attention_spearman": {
+    "rho": -0.8999999999999998,
+    "p": 0.03738607346849874,
+    "n": 5
+  }
+}

@@ -1,0 +1,78 @@
+{
+  "script": "survey_lens/make_paper_figures.py",
+  "script_version": "1.3.0",
+  "generated_utc": "2026-08-28T15:03:22Z",
+  "checkpoint": "runs/run3_joint_fov12/version_0/checkpoints/last.ckpt",
+  "checkpoint_sha256": "087e4d3ad079c4b6",
+  "git": {
+    "commit": "6906caef150071dc4c4c745bf1b5e237341adcb0",
+    "working_tree": "dirty"
+  },
+  "test_set_1_digest": "dbfb889d201e8ba7",
+  "test_set_2_digest": "d4723173a8169874",
+  "n_lenses": 200,
+  "seed": 12345,
+  "fov_arcsec": 12.0,
+  "surveys": {
+    "HST": {
+      "scale": 0.05,
+      "fwhm": 0.1
+    },
+    "Euclid": {
+      "scale": 0.1,
+      "fwhm": 0.16
+    },
+    "Roman": {
+      "scale": 0.11,
+      "fwhm": 0.12
+    },
+    "Rubin": {
+      "scale": 0.2,
+      "fwhm": 0.7
+    },
+    "DES": {
+      "scale": 0.263,
+      "fwhm": 0.9
+    }
+  },
+  "hero_lens_index": 59,
+  "worst_lens_index": 10,
+  "bootstrap": {
+    "n": 1000,
+    "pct": [
+      16,
+      84
+    ],
+    "seed": 0
+  },
+  "figures": {
+    "fig1_hero_grid": {
+      "pdf": "fig1_hero_grid.pdf",
+      "png": "fig1_hero_grid.png",
+      "data_csv": "fig1_hero_grid_data.csv",
+      "n_rows": 5,
+      "layout_check": "clean"
+    },
+    "fig3_survey_invariance": {
+      "pdf": "fig3_survey_invariance.pdf",
+      "png": "fig3_survey_invariance.png",
+      "data_csv": "fig3_survey_invariance_data.csv",
+      "n_rows": 20,
+      "layout_check": "clean"
+    },
+    "fig3_survey_invariance_noise": {
+      "pdf": "fig3_survey_invariance_noise.pdf",
+      "png": "fig3_survey_invariance_noise.png",
+      "data_csv": "fig3_survey_invariance_noise_data.csv",
+      "n_rows": 40,
+      "layout_check": "clean"
+    },
+    "figA1_hero_grid_appendix": {
+      "pdf": "figA1_hero_grid_appendix.pdf",
+      "png": "figA1_hero_grid_appendix.png",
+      "data_csv": "figA1_hero_grid_appendix_data.csv",
+      "n_rows": 15,
+      "layout_check": "clean"
+    }
+  }
+}

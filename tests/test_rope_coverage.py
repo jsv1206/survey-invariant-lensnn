@@ -1,0 +1,162 @@
+"""RoPE positional-encoding frequency-coverage guard.
+
+The 2D-RoPE bank must place its informative frequencies on the spatial scales
+that actually carry lensing signal -- arcs and the Einstein ring, theta_E in
+~0.5-2.5" across a 20" field -- rather than on scales far larger than the
+field (where the phase barely changes and the band is wasted).
+
+The finest representable wavelength is ~2*pi*theta_ref (since inv_freq[0]=1),
+and band k has wavelength lambda_k = 2*pi*theta_ref / base**(-k/n_freq). These
+tests assert the default (theta_ref, rope_base) keep enough bands in-field, and
+would have FAILED on the original (theta_ref=1.0, base=1e4) defaults that put
+only 3/16 bands in range with a 6.3" finest wavelength.
+"""
+import numpy as np
+import pytest
+import torch
+
+from survey_lens import env_setup  # noqa: F401
+from survey_lens.model import SurveyInvariantLensNet, build_2d_rope
+
+
+def _band_wavelengths(head_dim, theta_ref, base):
+    """Wavelengths (arcsec) of each RoPE frequency band for one axis."""
+    d_half = head_dim // 2
+    n_freq = d_half // 2
+    k = np.arange(n_freq)
+    inv_freq = base ** (-k / n_freq)          # radians per (arcsec/theta_ref)
+    return 2 * np.pi * theta_ref / inv_freq   # arcsec
+
+
+def test_default_finest_wavelength_is_subarcsec_scale():
+    net = SurveyInvariantLensNet(dim=64, n_heads=4)          # head_dim = 16
+    head_dim = net.dim // net.blocks[0].img_self.n_heads
+    wl = _band_wavelengths(head_dim, net.theta_ref, net.rope_base)
+    # finest wavelength must resolve the Einstein-ring scale (<= a few arcsec)
+    assert wl.min() <= 3.0, f"finest RoPE wavelength {wl.min():.2f}\" too coarse"
+
+
+@pytest.mark.parametrize("field", [20.0, 12.0])
+def test_default_bands_land_in_field(field):
+    """A healthy fraction of RoPE bands must have wavelengths that fit inside
+    the image, at every FOV the project actually trains at.
+
+    Parameterized over both FOVs because this is the assertion that binds how
+    far the field can shrink: the band wavelengths are fixed by
+    (theta_ref, rope_base) and do NOT rescale with the field, so a smaller
+    image pushes bands out the top of the range. Measured wavelengths at the
+    defaults are [2.83, 8.94, 28.27, 89.41]" -- 2 of 4 land in a 20" field and
+    the same 2 land in a 12" field, but only 1 would survive a 5" field, which
+    is one of the reasons 5" was rejected.
+    """
+    net = SurveyInvariantLensNet(dim=64, n_heads=4)
+    head_dim = net.dim // net.blocks[0].img_self.n_heads
+    wl = _band_wavelengths(head_dim, net.theta_ref, net.rope_base)
+    finest_patch = 4 * 0.05                                  # HST patch spacing, arcsec
+    in_field = ((wl >= 2 * finest_patch) & (wl <= field)).sum()
+    # want a healthy fraction of bands informative, not 3/16 as in the old default
+    assert in_field >= wl.size // 2, (
+        f"only {in_field}/{wl.size} RoPE bands in [{2*finest_patch:.1f}, {field}]\"")
+
+
+def test_old_default_would_fail_guard():
+    # sanity: the pre-fix tuning really was under-resolved (documents the fix)
+    wl = _band_wavelengths(16, theta_ref=1.0, base=1.0e4)
+    assert wl.min() > 5.0            # 6.28" finest -- too coarse
+    in_field = ((wl >= 0.4) & (wl <= 20.0)).sum()
+    assert in_field <= 4            # only 3/16 informative
+
+
+def test_all_frequency_bands_are_actually_applied():
+    """Every band `build_2d_rope` computes must reach the slots `apply_rope`
+    consumes.
+
+    This is the test that was missing. `build_2d_rope` used a
+    concatenate-duplicate layout while `apply_rope` indexes with [..., 0::2],
+    an interleaved-pair layout -- incompatible conventions that silently
+    discarded HALF the frequency bank (only even-indexed bands survived, each
+    applied twice, leaving three in-field wavelengths per axis). The other
+    tests in this file recompute inv_freq analytically and never call
+    apply_rope, so they were blind to it by construction.
+    """
+    head_dim = 32
+    n_freq = (head_dim // 2) // 2
+    pos = torch.tensor([[[1.0, 2.0]]])                     # one token, x=1, y=2
+    cos, sin = build_2d_rope(pos, head_dim, base=100.0)
+    used = cos[..., 0::2].flatten()                        # what apply_rope reads
+
+    idx = torch.arange(n_freq, dtype=torch.float32)
+    inv = 100.0 ** (-idx / n_freq)
+    expected = torch.cat([torch.cos(1.0 * inv), torch.cos(2.0 * inv)])
+
+    assert used.numel() == 2 * n_freq, "one slot pair per band per axis"
+    assert torch.allclose(torch.sort(used).values, torch.sort(expected).values, atol=1e-6), (
+        "the applied bands are not the full computed bank -- layout mismatch")
+    assert torch.unique(used.round(decimals=6)).numel() == used.numel(), (
+        "a band is applied more than once, so the bank is under-used")
+
+
+def test_finest_wavelength_not_aliased_at_coarsest_pixel_scale():
+    """The top RoPE band must be resolvable at the coarsest patch spacing the
+    model ever sees. Nyquist requires wavelength > 2 * patch * s_max.
+
+    With theta_ref=0.3, patch=4 and the training prior's s_max=0.32"/px, the
+    finest wavelength is 2*pi*0.3 = 1.885" against a requirement of 2.56" --
+    aliased, and aliased for DES (2.104") too. That is scale-DEPENDENT
+    positional degradation, which directly undermines the survey-invariance
+    mechanism the paper rests on.
+    """
+    net = SurveyInvariantLensNet(dim=64, n_heads=4)
+    s_max = 0.32                                            # sim_lens scale prior upper edge
+    finest = 2 * np.pi * net.theta_ref                      # inv_freq[0] == 1
+    need = 2 * net.patch * s_max
+    assert finest > need, (
+        f"finest RoPE wavelength {finest:.3f}\" aliases at s_max={s_max}\"/px "
+        f"(needs > {need:.3f}\"); raise theta_ref to > {need / (2 * np.pi):.3f}")
+
+
+def test_rope_positions_are_per_sample_not_batch_shared():
+    """Regression: forward() used to compute RoPE positions from `s[0]` only
+    and apply them to the WHOLE batch, on the (false) assumption that
+    same-npix bucketing implies identical `s`. It does not -- different
+    continuous-prior draws can round to the same npix (measured up to ~1.6%
+    relative `s` spread within a real training-cache bucket) -- so every
+    sample but the first silently got the wrong physical pixel scale baked
+    into its positional encoding.
+
+    Two batch items with IDENTICAL image/PSF content but DIFFERENT `s` must
+    produce DIFFERENT post-attention image-token representations: under the
+    old bug, sample 1's positions would incorrectly reuse sample 0's `s`,
+    making the two (deterministic, no dropout) token trajectories identical
+    despite the differing scale.
+    """
+    torch.manual_seed(0)
+    net = SurveyInvariantLensNet(patch=4, dim=32, depth=2, n_heads=2)
+    net.eval()
+    g0 = torch.randn(1, 1, 32, 32)
+    h0 = torch.rand(1, 1, 32, 32)
+    g = g0.repeat(2, 1, 1, 1)
+    h = h0.repeat(2, 1, 1, 1)
+    s = torch.tensor([0.10, 0.16])            # same npix bucket, different scale
+    with torch.no_grad():
+        out = net(g, h, s)
+    assert not torch.allclose(out["img_tokens"][0], out["img_tokens"][1]), (
+        "identical image content with different `s` gave identical token "
+        "representations -- positions are not being computed per-sample")
+
+
+def test_rope_base_is_threaded_into_forward():
+    # two models differing only in rope_base must produce different positional
+    # rotations -> different outputs on the same input (proves the wiring).
+    torch.manual_seed(0)
+    g = torch.randn(1, 1, 40, 40)
+    h = torch.randn(1, 1, 40, 40).abs()
+    s = torch.tensor([0.20])
+    a = SurveyInvariantLensNet(dim=64, depth=2, n_heads=4, rope_base=100.0)
+    b = SurveyInvariantLensNet(dim=64, depth=2, n_heads=4, rope_base=1.0e4)
+    b.load_state_dict(a.state_dict())        # identical weights, only base differs
+    a.eval(); b.eval()
+    with torch.no_grad():
+        ta = a(g, h, s)["theta_E"]
+        tb = b(g, h, s)["theta_E"]
+    assert not torch.allclose(ta, tb), "rope_base has no effect -- not threaded"
